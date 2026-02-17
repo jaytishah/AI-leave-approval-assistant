@@ -1,0 +1,262 @@
+FUNCTION ProcessLeaveRequest(leaveRequestId):
+
+  # ------------------------------------------------------------
+  # 1) Load request + employee + policies (from MCT HRMS DB/API)
+  # ------------------------------------------------------------
+  leaveReq      = HRMS_API.GetLeaveRequest(leaveRequestId)
+  employee      = HRMS_API.GetEmployee(leaveReq.employeeId)
+  orgPolicy     = HRMS_API.GetLeavePolicy(employee.departmentId, employee.locationId, employee.grade)
+  approverRules = HRMS_API.GetApproverRules(employee.departmentId)
+
+  IF leaveReq.status IN ["APPROVED", "REJECTED", "CANCELLED"]:
+      RETURN "NO_ACTION"
+
+  # Basic validation
+  IF leaveReq.startDate > leaveReq.endDate:
+      RETURN UpdateAndExit(leaveReq, "REJECTED", "Invalid date range")
+
+  requestedDays = DateUtil.BusinessDaysBetween(leaveReq.startDate, leaveReq.endDate, orgPolicy.holidays)
+
+  # ------------------------------------------------------------
+  # 2) Fetch past data (history + patterns)
+  # ------------------------------------------------------------
+  historyWindowDays = orgPolicy.historyWindowDays DEFAULT 180
+  leaveHistory      = HRMS_API.GetLeaveHistory(employee.id, lastDays=historyWindowDays)
+  attendance        = HRMS_API.GetAttendanceSummary(employee.id, lastDays=historyWindowDays)
+  balance           = HRMS_API.GetLeaveBalance(employee.id, leaveReq.leaveType)
+
+  # ------------------------------------------------------------
+  # 3) Hard rules engine (deterministic, policy first)
+  # ------------------------------------------------------------
+  violations = []
+
+  # 3.1 Leave balance check
+  IF balance.remainingDays < requestedDays AND orgPolicy.allowNegativeBalance == FALSE:
+      violations.ADD("Insufficient leave balance")
+
+  # 3.2 Notice period / advance request rule
+  daysBeforeStart = DateUtil.DaysBetween(CurrentDate(), leaveReq.startDate)
+  IF requestedDays >= orgPolicy.longLeaveThresholdDays AND daysBeforeStart < orgPolicy.minAdvanceDaysForLongLeave:
+      violations.ADD("Long leave requires advance notice")
+
+  # 3.3 Blackout dates / freeze
+  IF orgPolicy.IsInBlackoutPeriod(leaveReq.startDate, leaveReq.endDate):
+      violations.ADD("Leave requested in blackout period")
+
+  # 3.4 Frequent leave / pattern flags from history
+  stats = ComputeLeaveStats(leaveHistory, attendance, orgPolicy)
+
+  # Example pattern rules (configurable):
+  IF stats.unplannedLeavesLast30Days >= orgPolicy.maxUnplannedLeaves30Days:
+      violations.ADD("Too many unplanned leaves in last 30 days")
+
+  IF stats.mondayFridayPatternScore >= orgPolicy.maxPatternScore:
+      violations.ADD("Suspicious Monday/Friday leave pattern")
+
+  IF stats.consecutiveLeaveStreakDays + requestedDays > orgPolicy.maxConsecutiveLeaveDays:
+      violations.ADD("Exceeds max consecutive leave days")
+
+  # 3.5 Mandatory fields
+  IF IsEmpty(leaveReq.reasonText) AND orgPolicy.reasonMandatory == TRUE:
+      violations.ADD("Leave reason missing")
+
+  # If hard-rule violations are blocking:
+  IF AnyBlockingViolations(violations, orgPolicy):
+      decision = "REJECTED"
+      explanation = BuildExplanation(violations)
+      HRMS_API.UpdateLeaveDecision(leaveRequestId, decision, explanation, meta={ "engine": "RULES" })
+      HRMS_API.NotifyEmployee(employee.id, decision, explanation)
+      RETURN decision
+
+  # ------------------------------------------------------------
+  # 4) AI evaluation (advisory): is the reason "valid/plausible"?
+  #    - keys come from HRMS configuration table
+  #    - use minimal employee data (privacy)
+  # ------------------------------------------------------------
+  aiConfig = HRMS_API.GetConfig("AI_LEAVE_REASON_EVALUATOR") 
+  # Example config fields:
+  # aiConfig.provider = "OPENAI" | "GEMINI" | "COPILOT" | "AZURE_OPENAI"
+  # aiConfig.apiKeySecretRef OR aiConfig.keyId
+  # aiConfig.modelName
+  # aiConfig.temperature
+  # aiConfig.minConfidenceToApprove
+  # aiConfig.minConfidenceToAutoReject
+  # aiConfig.timeoutMs
+  # aiConfig.fallbackMode = "MANUAL_REVIEW" | "RULES_ONLY"
+
+  # Pull key from secure storage / config table mapping
+  apiKey = HRMS_API.GetSecretByRef(aiConfig.apiKeySecretRef)
+  IF IsEmpty(apiKey):
+      # Fail safe: do not auto-approve/reject solely due to missing key
+      RETURN RouteToManualReview(leaveReq, employee, "AI key not configured")
+
+  aiInput = BuildAIInputPayload(
+              leaveReq=leaveReq,
+              requestedDays=requestedDays,
+              policy=orgPolicy,
+              historyStats=stats,
+              # Keep it anonymized/minimal:
+              employeeContext={
+                "tenureMonths": employee.tenureMonths,
+                "roleLevel": employee.level,
+                "department": employee.departmentName
+              }
+           )
+
+  aiPrompt = """
+  You are assisting an HR leave triage system.
+  Task: Evaluate whether the leave reason is plausible and aligned with policy.
+  Return STRICT JSON ONLY with fields:
+    {
+      "reason_category": "...",
+      "validity_score": 0-100,
+      "risk_flags": ["..."],
+      "recommended_action": "APPROVE" | "REJECT" | "MANUAL_REVIEW",
+      "rationale": "short explanation"
+    }
+  Do NOT include personal judgments. Consider policy and patterns.
+  """
+
+  aiResponse = AI_PROVIDER.Call(
+                provider=aiConfig.provider,
+                apiKey=apiKey,
+                model=aiConfig.modelName,
+                prompt=aiPrompt,
+                inputJson=aiInput,
+                temperature=aiConfig.temperature,
+                timeoutMs=aiConfig.timeoutMs
+              )
+
+  IF aiResponse.error:
+      IF aiConfig.fallbackMode == "RULES_ONLY":
+          # If rules passed, approve or manual review based on org settings
+          RETURN ApproveOrManualByRules(leaveReq, employee, stats, orgPolicy, note="AI unavailable")
+      ELSE:
+          RETURN RouteToManualReview(leaveReq, employee, "AI evaluation failed")
+
+  aiJson = ParseStrictJson(aiResponse.text)
+  IF aiJson.invalid:
+      RETURN RouteToManualReview(leaveReq, employee, "AI returned invalid JSON")
+
+  # ------------------------------------------------------------
+  # 5) Final decision logic (rules + AI + thresholds)
+  #    - AI should not be the only rejection reason for high-stakes cases
+  # ------------------------------------------------------------
+  decision = "MANUAL_REVIEW"
+  explanationParts = []
+
+  explanationParts.ADD("Rules check: PASSED")
+  explanationParts.ADD("AI validity_score=" + aiJson.validity_score)
+  IF aiJson.risk_flags NOT EMPTY:
+      explanationParts.ADD("AI flags: " + Join(aiJson.risk_flags, ", "))
+
+  # Example thresholds (configurable):
+  IF aiJson.validity_score >= aiConfig.minConfidenceToApprove AND stats.riskLevel != "HIGH":
+      decision = "APPROVED"
+  ELSE IF aiJson.validity_score <= aiConfig.minConfidenceToAutoReject AND stats.riskLevel == "HIGH":
+      # Only auto-reject if BOTH low score + high historical risk (avoid false rejects)
+      decision = "REJECTED"
+  ELSE:
+      decision = "MANUAL_REVIEW"
+
+  # Additional guardrails:
+  IF requestedDays >= orgPolicy.longLeaveThresholdDays:
+      decision = "MANUAL_REVIEW"   # force manual for long leaves
+
+  IF orgPolicy.requireManagerApproval == TRUE:
+      decision = "MANUAL_REVIEW"   # route to manager queue even if AI says approve
+
+  explanation = Join(explanationParts, " | ")
+
+  # ------------------------------------------------------------
+  # 6) Persist outcome + audit trail
+  # ------------------------------------------------------------
+  auditMeta = {
+    "engine": "RULES+AI",
+    "ai_provider": aiConfig.provider,
+    "ai_model": aiConfig.modelName,
+    "ai_validity_score": aiJson.validity_score,
+    "ai_recommended_action": aiJson.recommended_action,
+    "history_window_days": historyWindowDays,
+    "computed_stats": stats
+  }
+
+  IF decision == "APPROVED":
+      HRMS_API.UpdateLeaveDecision(leaveRequestId, "APPROVED", explanation, meta=auditMeta)
+      HRMS_API.NotifyEmployee(employee.id, "APPROVED", explanation)
+      RETURN "APPROVED"
+
+  IF decision == "REJECTED":
+      HRMS_API.UpdateLeaveDecision(leaveRequestId, "REJECTED", explanation, meta=auditMeta)
+      HRMS_API.NotifyEmployee(employee.id, "REJECTED", explanation)
+      RETURN "REJECTED"
+
+  # Manual review route
+  HRMS_API.UpdateLeaveDecision(leaveRequestId, "PENDING_REVIEW", explanation, meta=auditMeta)
+  HRMS_API.CreateApprovalTask(
+      queue="HR_MANAGER_QUEUE",
+      leaveRequestId=leaveRequestId,
+      priority=ComputePriority(stats, requestedDays),
+      notes=explanation
+  )
+  HRMS_API.NotifyApprover(employee.managerId, "Leave requires review", explanation)
+  RETURN "MANUAL_REVIEW"
+
+
+
+# ------------------------------------------------------------
+# Helper: compute leave stats / patterns
+# ------------------------------------------------------------
+FUNCTION ComputeLeaveStats(leaveHistory, attendance, orgPolicy):
+
+  stats = {}
+  stats.unplannedLeavesLast30Days  = CountLeaves(leaveHistory, days=30, type="UNPLANNED")
+  stats.totalLeavesLast90Days      = CountLeaves(leaveHistory, days=90)
+  stats.consecutiveLeaveStreakDays = MaxConsecutiveLeaveDays(leaveHistory, endAt=CurrentDate())
+
+  # Pattern detection (Mon/Fri)
+  stats.mondayLeavesLast90Days = CountLeavesOnWeekday(leaveHistory, days=90, weekday="MON")
+  stats.fridayLeavesLast90Days = CountLeavesOnWeekday(leaveHistory, days=90, weekday="FRI")
+  stats.mondayFridayPatternScore = PatternScore(stats.mondayLeavesLast90Days, stats.fridayLeavesLast90Days)
+
+  # Risk level (simple example; make it configurable)
+  stats.riskLevel = "LOW"
+  IF stats.unplannedLeavesLast30Days >= orgPolicy.maxUnplannedLeaves30Days:
+      stats.riskLevel = "HIGH"
+  ELSE IF stats.totalLeavesLast90Days >= orgPolicy.maxLeaves90Days:
+      stats.riskLevel = "MEDIUM"
+
+  RETURN stats
+
+
+
+# ------------------------------------------------------------
+# Helper: build AI input payload (privacy-first)
+# ------------------------------------------------------------
+FUNCTION BuildAIInputPayload(leaveReq, requestedDays, policy, historyStats, employeeContext):
+
+  RETURN {
+    "leave_type": leaveReq.leaveType,
+    "start_date": leaveReq.startDate,
+    "end_date": leaveReq.endDate,
+    "requested_days": requestedDays,
+    "reason_text": leaveReq.reasonText,
+    "policy": {
+      "reason_mandatory": policy.reasonMandatory,
+      "long_leave_threshold_days": policy.longLeaveThresholdDays,
+      "max_unplanned_leaves_30_days": policy.maxUnplannedLeaves30Days
+    },
+    "history_stats": historyStats,
+    "employee_context": employeeContext
+  }
+
+
+
+# ------------------------------------------------------------
+# Helper: route to manual review
+# ------------------------------------------------------------
+FUNCTION RouteToManualReview(leaveReq, employee, note):
+  HRMS_API.UpdateLeaveDecision(leaveReq.id, "PENDING_REVIEW", note, meta={ "engine": "FALLBACK" })
+  HRMS_API.CreateApprovalTask(queue="HR_MANAGER_QUEUE", leaveRequestId=leaveReq.id, priority="HIGH", notes=note)
+  HRMS_API.NotifyApprover(employee.managerId, "Leave requires review", note)
+  RETURN "MANUAL_REVIEW"
