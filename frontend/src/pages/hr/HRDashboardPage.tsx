@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   Clock,
   CheckCircle,
@@ -17,6 +17,7 @@ import {
 import { Link } from 'react-router-dom';
 import { adminApi } from '@/services/api';
 import { Card, Badge, Button, Avatar } from '@/components/ui';
+import AIAnalyticsDashboard from '@/components/AIAnalyticsDashboard';
 
 // Medical Certificate Validation interface
 interface MedicalCertificateValidation {
@@ -55,6 +56,19 @@ interface DashboardStats {
   pending_change_percent: number;
 }
 
+interface UpcomingLeave {
+  id: number;
+  employee_name: string;
+  employee_email: string;
+  employee_department?: string;
+  leave_type: string;
+  start_date: string;
+  end_date: string;
+  total_days: number;
+  is_today: boolean;
+  is_tomorrow: boolean;
+}
+
 const containerVariants = {
   hidden: { opacity: 0 },
   visible: {
@@ -73,28 +87,37 @@ const itemVariants = {
 export default function HRDashboardPage() {
   const [requests, setRequests] = useState<PendingRequest[]>([]);
   const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [upcomingLeaves, setUpcomingLeaves] = useState<UpcomingLeave[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterRisk, setFilterRisk] = useState<string>('all');
-  
+  const [showAnalytics, setShowAnalytics] = useState(false);
+
   useEffect(() => {
     fetchDashboard();
   }, []);
-  
+
   const fetchDashboard = async () => {
     try {
-      const requestsRes = await adminApi.getPendingRequests();
+      const [requestsRes, dashboardRes] = await Promise.all([
+        adminApi.getPendingRequests(),
+        adminApi.getHRDashboard()
+      ]);
+
       console.log('[HR Dashboard] Pending requests:', requestsRes.data);
+      console.log('[HR Dashboard] Dashboard data:', dashboardRes.data);
+
       setRequests(requestsRes.data || []);
-      
+      setUpcomingLeaves(dashboardRes.data?.upcoming_leaves || []);
+
       // Calculate stats from requests
       const pending = requestsRes.data || [];
       const highRisk = pending.filter((r: PendingRequest) => r.risk_level === 'HIGH').length;
       setStats({
         total_pending: pending.length,
         high_risk_flagged: highRisk,
-        team_coverage: 94,
-        pending_change_percent: 0
+        team_coverage: dashboardRes.data?.stats?.team_coverage || 94,
+        pending_change_percent: dashboardRes.data?.stats?.pending_change_percent || 0
       });
     } catch (error) {
       console.error('Failed to fetch HR dashboard:', error);
@@ -102,7 +125,7 @@ export default function HRDashboardPage() {
       setIsLoading(false);
     }
   };
-  
+
   const filteredRequests = requests.filter((req) => {
     const matchesSearch =
       req.employee_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -111,7 +134,7 @@ export default function HRDashboardPage() {
     const matchesFilter = filterRisk === 'all' || req.risk_level?.toLowerCase() === filterRisk;
     return matchesSearch && matchesFilter;
   });
-  
+
   const getRiskBadge = (risk: string, score: number) => {
     const variants: Record<string, 'success' | 'warning' | 'danger'> = {
       low: 'success',
@@ -127,7 +150,7 @@ export default function HRDashboardPage() {
       </div>
     );
   };
-  
+
   const getRecommendationIcon = (recommendation: string) => {
     switch (recommendation.toLowerCase()) {
       case 'approve':
@@ -138,7 +161,7 @@ export default function HRDashboardPage() {
         return <AlertTriangle className="w-4 h-4 text-amber-500" />;
     }
   };
-  
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-96">
@@ -146,7 +169,7 @@ export default function HRDashboardPage() {
       </div>
     );
   }
-  
+
   return (
     <motion.div
       variants={containerVariants}
@@ -167,7 +190,7 @@ export default function HRDashboardPage() {
           </Badge>
         </div>
       </motion.div>
-      
+
       {/* Stats Cards */}
       <motion.div variants={itemVariants} className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatsCard
@@ -195,7 +218,7 @@ export default function HRDashboardPage() {
           color="blue"
         />
       </motion.div>
-      
+
       {/* Pending Requests Section */}
       <motion.div variants={itemVariants}>
         <Card>
@@ -233,7 +256,7 @@ export default function HRDashboardPage() {
               </div>
             </div>
           </div>
-          
+
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead className="bg-gray-50">
@@ -299,24 +322,22 @@ export default function HRDashboardPage() {
                           {/* Medical Certificate Indicator for SICK leave */}
                           {request.leave_type === 'SICK' && request.medical_certificate_url && (
                             <div className="relative group">
-                              <div className={`w-6 h-6 rounded-full flex items-center justify-center ${
-                                request.medical_certificate_validation?.result === 'VALID' 
-                                  ? 'bg-green-100' 
+                              <div className={`w-6 h-6 rounded-full flex items-center justify-center ${request.medical_certificate_validation?.result === 'VALID'
+                                  ? 'bg-green-100'
                                   : request.medical_certificate_validation?.result === 'NEEDS_REVIEW'
-                                  ? 'bg-amber-100'
-                                  : request.medical_certificate_validation?.result === 'INVALID'
-                                  ? 'bg-red-100'
-                                  : 'bg-blue-100'
-                              }`}>
-                                <FileCheck className={`w-3.5 h-3.5 ${
-                                  request.medical_certificate_validation?.result === 'VALID' 
-                                    ? 'text-green-600' 
-                                    : request.medical_certificate_validation?.result === 'NEEDS_REVIEW'
-                                    ? 'text-amber-600'
+                                    ? 'bg-amber-100'
                                     : request.medical_certificate_validation?.result === 'INVALID'
-                                    ? 'text-red-600'
-                                    : 'text-blue-600'
-                                }`} />
+                                      ? 'bg-red-100'
+                                      : 'bg-blue-100'
+                                }`}>
+                                <FileCheck className={`w-3.5 h-3.5 ${request.medical_certificate_validation?.result === 'VALID'
+                                    ? 'text-green-600'
+                                    : request.medical_certificate_validation?.result === 'NEEDS_REVIEW'
+                                      ? 'text-amber-600'
+                                      : request.medical_certificate_validation?.result === 'INVALID'
+                                        ? 'text-red-600'
+                                        : 'text-blue-600'
+                                  }`} />
                               </div>
                               {/* Tooltip */}
                               <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
@@ -383,7 +404,7 @@ export default function HRDashboardPage() {
           </div>
         </Card>
       </motion.div>
-      
+
       {/* Quick Actions & Insights */}
       <motion.div variants={itemVariants} className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* AI Insights */}
@@ -398,7 +419,7 @@ export default function HRDashboardPage() {
                 <p className="text-sm text-gray-500">Smart recommendations</p>
               </div>
             </div>
-            
+
             <div className="space-y-3">
               <InsightItem
                 type="info"
@@ -415,8 +436,8 @@ export default function HRDashboardPage() {
             </div>
           </div>
         </Card>
-        
-        {/* Team Overview */}
+
+        {/* Leave Summary - Today/Tomorrow/Next 7 Days */}
         <Card>
           <div className="p-6">
             <div className="flex items-center gap-3 mb-4">
@@ -424,34 +445,72 @@ export default function HRDashboardPage() {
                 <Users className="w-5 h-5 text-white" />
               </div>
               <div>
-                <h3 className="font-semibold text-gray-900">Currently On Leave</h3>
-                <p className="text-sm text-gray-500">Team members away today</p>
+                <h3 className="font-semibold text-gray-900">Upcoming Leaves</h3>
+                <p className="text-sm text-gray-500">Next 7 days</p>
               </div>
             </div>
-            
+
             <div className="space-y-3">
-              {[
-                { name: 'Sarah Johnson', dept: 'Marketing', return: 'Tomorrow' },
-                { name: 'Mike Chen', dept: 'Engineering', return: 'Dec 15' },
-                { name: 'Emily Davis', dept: 'Design', return: 'Dec 18' },
-              ].map((person, index) => (
-                <div
-                  key={index}
-                  className="flex items-center justify-between p-3 bg-gray-50 rounded-lg"
-                >
-                  <div className="flex items-center gap-3">
-                    <Avatar name={person.name} size="sm" />
-                    <div>
-                      <p className="font-medium text-sm text-gray-900">{person.name}</p>
-                      <p className="text-xs text-gray-500">{person.dept}</p>
+              {upcomingLeaves.length === 0 ? (
+                <p className="text-sm text-gray-500 text-center py-4">No upcoming leaves in the next 7 days</p>
+              ) : (
+                upcomingLeaves.map((leave) => (
+                  <div
+                    key={leave.id}
+                    className="flex items-center justify-between p-3 bg-gray-50 rounded-lg"
+                  >
+                    <div className="flex items-center gap-3">
+                      <Avatar name={leave.employee_name} size="sm" />
+                      <div>
+                        <p className="font-medium text-sm text-gray-900">{leave.employee_name}</p>
+                        <p className="text-xs text-gray-500">
+                          {leave.employee_department || 'N/A'} • {leave.leave_type}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      {leave.is_today ? (
+                        <Badge variant="success" size="sm">Today</Badge>
+                      ) : leave.is_tomorrow ? (
+                        <Badge variant="warning" size="sm">Tomorrow</Badge>
+                      ) : (
+                        <span className="text-xs text-gray-500">
+                          {new Date(leave.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                        </span>
+                      )}
+                      <p className="text-xs text-gray-400 mt-0.5">{leave.total_days} day{leave.total_days !== 1 ? 's' : ''}</p>
                     </div>
                   </div>
-                  <span className="text-xs text-gray-500">Returns {person.return}</span>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           </div>
         </Card>
+      </motion.div>
+
+      {/* ── AI Token Analytics ─────────────────────────────────────────── */}
+      <motion.div variants={itemVariants}>
+        <button
+          onClick={() => setShowAnalytics(v => !v)}
+          className="flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800 transition-colors mb-3"
+        >
+          <Brain className="w-4 h-4" />
+          {showAnalytics ? 'Hide' : 'Show'} AI Token Analytics
+          <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-1">Gemini</span>
+        </button>
+        <AnimatePresence>
+          {showAnalytics && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.3 }}
+              style={{ overflow: 'hidden' }}
+            >
+              <AIAnalyticsDashboard />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </motion.div>
     </motion.div>
   );
@@ -474,7 +533,7 @@ function StatsCard({ icon: Icon, label, value, color }: StatsCardProps) {
     blue: 'bg-blue-50 text-blue-600',
     purple: 'bg-purple-50 text-purple-600',
   };
-  
+
   return (
     <motion.div
       whileHover={{ scale: 1.02 }}
@@ -501,10 +560,10 @@ function InsightItem({ type, message }: InsightItemProps) {
     warning: { bg: 'bg-amber-50', icon: AlertTriangle, iconColor: 'text-amber-500' },
     success: { bg: 'bg-green-50', icon: CheckCircle, iconColor: 'text-green-500' },
   };
-  
+
   const style = styles[type];
   const Icon = style.icon;
-  
+
   return (
     <div className={`p-3 rounded-lg ${style.bg} flex items-start gap-3`}>
       <Icon className={`w-4 h-4 ${style.iconColor} flex-shrink-0 mt-0.5`} />

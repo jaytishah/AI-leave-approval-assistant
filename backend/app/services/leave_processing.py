@@ -3,13 +3,14 @@ from typing import Optional, Tuple
 from sqlalchemy.orm import Session
 from app.models import (
     LeaveRequest, LeaveStatus, LeaveBalance, LeavePolicy,
-    LeaveAuditLog, ApprovalTask, User, RiskLevel
+    LeaveAuditLog, ApprovalTask, User, RiskLevel, AIUsageLog
 )
 from app.services.leave_utils import (
     business_days_between, compute_leave_stats, check_rule_violations,
     is_blocking_violation, build_explanation, compute_priority,
-    generate_request_number
+    generate_request_number, calculate_working_days
 )
+from app.models import CompanyPolicy
 from app.services.ai_service import evaluate_leave_with_ai
 from app.services.email_service import email_service
 from app.core.config import settings
@@ -50,11 +51,22 @@ class LeaveProcessingService:
             await self._update_and_exit(leave_req, LeaveStatus.REJECTED, "Invalid date range")
             return "REJECTED"
         
-        # Calculate requested days
-        holidays = org_policy.holidays if org_policy else []
-        requested_days = business_days_between(
+        # Get company policy for weekly off configuration
+        company_policy = self.db.query(CompanyPolicy).order_by(CompanyPolicy.updated_at.desc()).first()
+        weekly_off_type = company_policy.weekly_off_type.value if company_policy else "SAT_SUN"
+        
+        # Get holidays from Holiday table
+        from app.models.models import Holiday
+        holiday_records = self.db.query(Holiday).filter(
+            Holiday.is_active == True
+        ).all()
+        holidays = [h.date.strftime("%Y-%m-%d") for h in holiday_records]
+        
+        # Calculate requested days using proper working days calculation
+        requested_days = calculate_working_days(
             leave_req.start_date,
             leave_req.end_date,
+            weekly_off_type,
             holidays
         )
         leave_req.total_days = requested_days
@@ -84,6 +96,20 @@ class LeaveProcessingService:
         
         # 4) AI evaluation
         ai_result = await self._evaluate_with_ai(leave_req, requested_days, org_policy, stats, employee)
+        
+        # ── Analytics: log token usage (isolated, never affects approval) ─
+        try:
+            self._log_ai_usage(
+                ai_result=ai_result,
+                employee_id=employee.id,
+                leave_request_id=leave_req.id,
+                call_type="LEAVE_EVALUATION",
+                leave_type=leave_req.leave_type.value if leave_req.leave_type else None,
+                ai_recommended_action=ai_result.get("recommended_action")
+            )
+        except Exception as exc:
+            print(f"[AI Analytics] Usage log failed (non-fatal): {exc}")
+        # ─────────────────────────────────────────────────────────────────
         
         # Store AI results
         leave_req.ai_validity_score = ai_result.get("validity_score")
@@ -288,7 +314,7 @@ class LeaveProcessingService:
             actor_type="SYSTEM",
             new_status=status.value,
             details=explanation,
-            metadata=audit_meta
+            extra_data=audit_meta
         )
         
         self.db.commit()
@@ -314,7 +340,7 @@ class LeaveProcessingService:
             actor_type="SYSTEM",
             new_status=status.value,
             details=explanation,
-            metadata={"engine": engine}
+            extra_data={"engine": engine}
         )
         
         self.db.commit()
@@ -381,7 +407,7 @@ class LeaveProcessingService:
             actor_type="SYSTEM",
             new_status=LeaveStatus.PENDING_REVIEW.value,
             details=note,
-            metadata={"engine": "FALLBACK"}
+            extra_data={"engine": "FALLBACK"}
         )
         
         self._create_approval_task(leave_req, {}, leave_req.total_days, note, priority="HIGH")
@@ -413,7 +439,7 @@ class LeaveProcessingService:
                 actor_type="SYSTEM",
                 new_status=LeaveStatus.APPROVED.value,
                 details=note,
-                metadata={"engine": "RULES_ONLY"}
+                extra_data={"engine": "RULES_ONLY"}
             )
             
             self.db.commit()
@@ -431,7 +457,7 @@ class LeaveProcessingService:
         previous_status: str = None,
         new_status: str = None,
         details: str = None,
-        metadata: dict = None
+        extra_data: dict = None
     ):
         """Create audit log entry"""
         audit_log = LeaveAuditLog(
@@ -442,7 +468,7 @@ class LeaveProcessingService:
             previous_status=previous_status,
             new_status=new_status,
             details=details,
-            metadata=metadata
+            extra_data=extra_data
         )
         self.db.add(audit_log)
     
@@ -466,6 +492,44 @@ class LeaveProcessingService:
             status="OPEN"
         )
         self.db.add(task)
+
+    def _log_ai_usage(
+        self,
+        ai_result: dict,
+        employee_id: Optional[int],
+        leave_request_id: Optional[int],
+        call_type: str,
+        leave_type: Optional[str] = None,
+        ai_recommended_action: Optional[str] = None
+    ):
+        """Write a single AI usage log row.
+        
+        Only called when ai_result contains token keys (i.e. a successful
+        Gemini API call was made). If those keys are absent the log is silently
+        skipped — this happens for early-exit paths (injection detected,
+        gibberish, quota errors).
+        
+        CRITICAL: This method MUST NOT raise. Always call inside try/except.
+        """
+        prompt_tokens = ai_result.get("_prompt_tokens")
+        # If token keys are missing the AI call never reached Gemini (pre-flight
+        # rejection or API error) — do not log.
+        if prompt_tokens is None:
+            return
+        
+        usage_log = AIUsageLog(
+            employee_id=employee_id,
+            leave_request_id=leave_request_id,
+            call_type=call_type,
+            leave_type=leave_type,
+            model_name=ai_result.get("_model_name", settings.GEMINI_MODEL),
+            prompt_tokens=ai_result.get("_prompt_tokens", 0),
+            output_tokens=ai_result.get("_output_tokens", 0),
+            total_tokens=ai_result.get("_total_tokens", 0),
+            ai_recommended_action=ai_recommended_action
+        )
+        self.db.add(usage_log)
+        self.db.commit()
 
 
 async def process_leave_request(db: Session, leave_request_id: int) -> str:

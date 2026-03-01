@@ -143,7 +143,12 @@ def compute_leave_stats(leave_history: List[LeaveRequest], policy: LeavePolicy) 
         "monday_leaves_last_90_days": 0,
         "friday_leaves_last_90_days": 0,
         "monday_friday_pattern_score": 0.0,
-        "risk_level": "LOW"
+        "risk_level": "LOW",
+        # NEW: Weekly/Monthly tracking
+        "leaves_this_week": 0,
+        "leaves_this_month": 0,
+        "days_this_week": 0,
+        "days_this_month": 0
     }
     
     if not leave_history:
@@ -152,6 +157,14 @@ def compute_leave_stats(leave_history: List[LeaveRequest], policy: LeavePolicy) 
     # Count unplanned leaves in last 30 days (assuming SICK and leaves < 1 day notice are unplanned)
     cutoff_30 = datetime.now() - timedelta(days=30)
     cutoff_90 = datetime.now() - timedelta(days=90)
+    
+    # Get current week boundaries (Monday to Sunday)
+    now = datetime.now()
+    week_start = now - timedelta(days=now.weekday())  # Monday of current week
+    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get current month boundaries
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
     for leave in leave_history:
         if leave.status.value in ["APPROVED", "PENDING", "PENDING_REVIEW"]:
@@ -169,6 +182,16 @@ def compute_leave_stats(leave_history: List[LeaveRequest], policy: LeavePolicy) 
                 days_notice = (leave.start_date - leave.created_at).days
                 if days_notice < 1 or leave.leave_type.value == "SICK":
                     stats["unplanned_leaves_last_30_days"] += 1
+            
+            # NEW: Weekly tracking (leaves applied this week)
+            if leave.created_at >= week_start:
+                stats["leaves_this_week"] += 1
+                stats["days_this_week"] += int(leave.total_days or 0)
+            
+            # NEW: Monthly tracking (leaves applied this month)
+            if leave.created_at >= month_start:
+                stats["leaves_this_month"] += 1
+                stats["days_this_month"] += int(leave.total_days or 0)
     
     # Calculate consecutive streak
     stats["consecutive_leave_streak_days"] = max_consecutive_leave_days(leave_history)
@@ -227,13 +250,48 @@ def check_rule_violations(
     if current_streak + requested_days > policy.max_consecutive_leave_days:
         violations.append(f"Exceeds maximum consecutive leave days ({policy.max_consecutive_leave_days})")
     
-    # 7. Reason mandatory check
+    # 7. NEW: Weekly leave limits
+    if stats.get("leaves_this_week", 0) >= policy.max_leaves_per_week:
+        violations.append(f"Maximum leave requests per week ({policy.max_leaves_per_week}) already reached")
+    
+    if stats.get("days_this_week", 0) + requested_days > policy.max_days_per_week:
+        violations.append(f"Exceeds maximum leave days per week ({policy.max_days_per_week})")
+    
+    # 8. NEW: Monthly leave limits
+    if stats.get("leaves_this_month", 0) >= policy.max_leaves_per_month:
+        violations.append(f"Maximum leave requests per month ({policy.max_leaves_per_month}) already reached")
+    
+    if stats.get("days_this_month", 0) + requested_days > policy.max_days_per_month:
+        violations.append(f"Exceeds maximum leave days per month ({policy.max_days_per_month})")
+    
+    # 9. Reason mandatory check
     if policy.reason_mandatory and not leave_request.reason_text:
         violations.append("Leave reason is required")
     
-    # 8. Date validation
+    # 10. Date validation
     if leave_request.start_date > leave_request.end_date:
         violations.append("Invalid date range: start date after end date")
+    
+    # 11. Medical certificate mandatory for SICK leave > 2 days (COMPANY POLICY)
+    from app.models import LeaveType
+    if leave_request.leave_type == LeaveType.SICK and requested_days > 2:
+        if not leave_request.medical_certificate_url:
+            violations.append("Medical certificate is mandatory for sick leave exceeding 2 consecutive days")
+    
+    # 11b. Sick leave date validation - only today or previous days allowed
+    if leave_request.leave_type == LeaveType.SICK:
+        today = datetime.now().date()
+        leave_start_date = leave_request.start_date.date() if isinstance(leave_request.start_date, datetime) else leave_request.start_date
+        if leave_start_date > today:
+            violations.append("Sick leave can only be taken for today or previous days, not for future dates")
+    
+    # 12. 1-day advance notice for Casual Leave (COMPANY POLICY - except emergencies)
+    if leave_request.leave_type == LeaveType.CASUAL:
+        days_before_start_casual = (leave_request.start_date - datetime.now()).days
+        # Allow same-day for emergencies (check if 'is_emergency' flag exists)
+        is_emergency = getattr(leave_request, 'is_emergency', False)
+        if days_before_start_casual < 1 and not is_emergency:
+            violations.append("Casual Leave requires at least 1 working day advance notice (except emergencies)")
     
     return violations
 
@@ -244,7 +302,10 @@ def is_blocking_violation(violations: List[str], policy: LeavePolicy) -> bool:
         "Insufficient leave balance",
         "Invalid date range",
         "blackout period",
-        "Leave reason is required"
+        "Leave reason is required",
+        "Medical certificate is mandatory",
+        "advance notice",
+        "Sick leave can only be taken"
     ]
     
     for violation in violations:
@@ -292,3 +353,180 @@ def generate_request_number() -> str:
     timestamp = datetime.now().strftime("%Y%m%d")
     random_suffix = ''.join(random.choices(string.digits, k=4))
     return f"LR-{timestamp}-{random_suffix}"
+
+
+def is_weekend(date, weekly_off_type: str) -> bool:
+    """
+    Check if a given date is a weekend based on company policy.
+    
+    Args:
+        date: datetime.date object
+        weekly_off_type: 'SUNDAY', 'SAT_SUN', or 'ALT_SAT'
+    
+    Returns:
+        True if date is a weekend, False otherwise
+    """
+    weekday = date.weekday()  # 0 = Monday, 6 = Sunday
+    
+    if weekly_off_type == "SUNDAY":
+        # Only Sunday off
+        return weekday == 6
+    
+    elif weekly_off_type == "SAT_SUN":
+        # Saturday and Sunday off
+        return weekday in [5, 6]  # 5 = Saturday, 6 = Sunday
+    
+    elif weekly_off_type == "ALT_SAT":
+        # 2nd and 4th Saturday off (alternate Saturdays)
+        if weekday == 6:  # Sunday is always off
+            return True
+        if weekday == 5:  # Saturday
+            # Check if this is 2nd or 4th Saturday of the month
+            day = date.day
+            week_of_month = (day - 1) // 7 + 1
+            return week_of_month in [2, 4]
+        return False
+    
+    return False
+
+
+def calculate_working_days(start_date, end_date, weekly_off_type: str = "SAT_SUN", holidays: List = None) -> int:
+    """
+    Calculate actual working days between start_date and end_date.
+    
+    Requirements:
+    - Inclusive counting (both start and end dates included)
+    - Excludes weekends based on company policy
+    - Excludes holidays (if provided)
+    - Works across months and years
+    - Handles leap years automatically
+    
+    Args:
+        start_date: datetime.date or datetime object
+        end_date: datetime.date or datetime object
+        weekly_off_type: 'SUNDAY', 'SAT_SUN', or 'ALT_SAT'
+        holidays: List of holiday dates (datetime.date or string 'YYYY-MM-DD')
+    
+    Returns:
+        int: Number of working days
+    
+    Examples:
+        >>> calculate_working_days(date(2026, 3, 28), date(2026, 3, 31), "SAT_SUN")
+        2  # Fri 28 and Mon 31 (Sat 29, Sun 30 excluded)
+        
+        >>> calculate_working_days(date(2026, 3, 31), date(2026, 4, 2), "SAT_SUN")
+        3  # Tue 31 Mar, Wed 1 Apr, Thu 2 Apr
+    """
+    # Validation: start_date must not be after end_date
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date")
+    
+    # Convert to date objects if datetime
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+    
+    # Parse holidays list
+    holiday_dates = set()
+    if holidays:
+        for h in holidays:
+            try:
+                if isinstance(h, str):
+                    holiday_dates.add(datetime.strptime(h, "%Y-%m-%d").date())
+                elif isinstance(h, datetime):
+                    holiday_dates.add(h.date())
+                elif hasattr(h, 'date'):  # datetime.date object
+                    holiday_dates.add(h)
+            except:
+                pass
+    
+    # Iterate day by day
+    working_days = 0
+    current_date = start_date
+    
+    while current_date <= end_date:
+        # Check if it's a weekend
+        if not is_weekend(current_date, weekly_off_type):
+            # Check if it's a holiday
+            if current_date not in holiday_dates:
+                working_days += 1
+        
+        # Move to next day
+        current_date += timedelta(days=1)
+    
+    return working_days
+
+
+def calculate_working_days_detailed(start_date, end_date, weekly_off_type: str = "SAT_SUN", holidays: List = None) -> dict:
+    """
+    Calculate working days with detailed breakdown.
+    
+    Returns dict with:
+        - total_calendar_days: Total days including weekends
+        - working_days: Actual working days
+        - weekend_days: Days excluded due to weekends
+        - holiday_days: Days excluded due to holidays
+        - breakdown: List of each day with status
+    """
+    # Validation
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date")
+    
+    # Convert to date objects
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+    
+    # Parse holidays
+    holiday_dates = set()
+    if holidays:
+        for h in holidays:
+            try:
+                if isinstance(h, str):
+                    holiday_dates.add(datetime.strptime(h, "%Y-%m-%d").date())
+                elif isinstance(h, datetime):
+                    holiday_dates.add(h.date())
+                elif hasattr(h, 'date'):
+                    holiday_dates.add(h)
+            except:
+                pass
+    
+    # Calculate
+    total_days = (end_date - start_date).days + 1
+    working_days = 0
+    weekend_days = 0
+    holiday_days = 0
+    breakdown = []
+    
+    current_date = start_date
+    while current_date <= end_date:
+        day_status = {
+            "date": current_date.strftime("%Y-%m-%d"),
+            "weekday": current_date.strftime("%A"),
+            "is_working_day": True,
+            "reason": None
+        }
+        
+        if is_weekend(current_date, weekly_off_type):
+            weekend_days += 1
+            day_status["is_working_day"] = False
+            day_status["reason"] = "Weekend"
+        elif current_date in holiday_dates:
+            holiday_days += 1
+            day_status["is_working_day"] = False
+            day_status["reason"] = "Holiday"
+        else:
+            working_days += 1
+        
+        breakdown.append(day_status)
+        current_date += timedelta(days=1)
+    
+    return {
+        "total_calendar_days": total_days,
+        "working_days": working_days,
+        "weekend_days": weekend_days,
+        "holiday_days": holiday_days,
+        "breakdown": breakdown
+    }

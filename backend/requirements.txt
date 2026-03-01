@@ -14,5 +14,6 @@ email-validator
 cryptography
 httpx
 PyPDF2
-pytesseract
 Pillow
+opencv-python
+easyocr

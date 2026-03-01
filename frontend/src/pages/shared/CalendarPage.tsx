@@ -4,9 +4,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Calendar as CalendarIcon,
+  Users,
+  Briefcase,
 } from 'lucide-react';
-import { leaveApi, adminApi } from '@/services/api';
-import { Card } from '@/components/ui';
+import { adminApi } from '@/services/api';
+import { Card, Badge } from '@/components/ui';
 
 interface CalendarEvent {
   id: number;
@@ -17,20 +19,12 @@ interface CalendarEvent {
   leave_type?: string;
 }
 
-interface ApprovedLeave {
+interface CompanyPolicy {
   id: number;
-  leave_type: string;
-  start_date: string;
-  end_date: string;
-  total_days: number;
-  reason_text?: string;
-}
-
-interface Holiday {
-  id: number;
-  name: string;
-  date: string;
-  is_active: boolean;
+  weekly_off_type: string;
+  description: string;
+  effective_from: string | null;
+  updated_at: string | null;
 }
 
 const containerVariants = {
@@ -58,70 +52,89 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 export default function CalendarPage() {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [events, setEvents] = useState<CalendarEvent[]>([]);
-  const [approvedLeaves, setApprovedLeaves] = useState<ApprovedLeave[]>([]);
-  const [holidays, setHolidays] = useState<Holiday[]>([]);
+  const [policy, setPolicy] = useState<CompanyPolicy | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   
   useEffect(() => {
+    fetchPolicy();
     fetchEvents();
   }, [currentDate]);
   
+  const fetchPolicy = async () => {
+    try {
+      const response = await adminApi.getCompanyPolicy();
+      setPolicy(response);
+    } catch (error) {
+      console.error('Failed to fetch policy:', error);
+      // Default to SAT_SUN if fetch fails
+      setPolicy({
+        id: 1,
+        weekly_off_type: 'SAT_SUN',
+        description: 'Saturday and Sunday weekly off',
+        effective_from: null,
+        updated_at: null,
+      });
+    }
+  };
+  
   const fetchEvents = async () => {
     try {
-      // Fetch employee's approved leaves and holidays
-      const [leavesResponse, holidaysResponse] = await Promise.all([
-        leaveApi.getMyApprovedLeaves(),
-        adminApi.getHolidays()
-      ]);
-      
-      setApprovedLeaves(leavesResponse);
-      setHolidays(holidaysResponse.filter((h: Holiday) => h.is_active));
-      
-      // Convert to calendar events
-      const events: CalendarEvent[] = [];
-      
-      // Add approved leaves
-      leavesResponse.forEach((leave: ApprovedLeave) => {
-        const startDate = new Date(leave.start_date);
-        const endDate = new Date(leave.end_date);
-        const currentDateCopy = new Date(startDate);
-        
-        while (currentDateCopy <= endDate) {
-          if (currentDateCopy.getMonth() === currentDate.getMonth() && 
-              currentDateCopy.getFullYear() === currentDate.getFullYear()) {
-            events.push({
-              id: leave.id,
-              title: `${leave.leave_type} Leave`,
-              date: currentDateCopy.toISOString().split('T')[0],
-              type: 'leave',
-              leave_type: leave.leave_type
-            });
-          }
-          currentDateCopy.setDate(currentDateCopy.getDate() + 1);
-        }
-      });
-      
-      // Add holidays for current month
-      holidaysResponse.forEach((holiday: Holiday) => {
-        const holidayDate = new Date(holiday.date);
-        if (holidayDate.getMonth() === currentDate.getMonth() && 
-            holidayDate.getFullYear() === currentDate.getFullYear() &&
-            holiday.is_active) {
-          events.push({
-            id: holiday.id + 10000,
-            title: holiday.name,
-            date: holiday.date.split('T')[0],
-            type: 'holiday'
-          });
-        }
-      });
-      
-      setEvents(events);
+      // Fetch leaves and holidays for the current month
+      const response = await adminApi.getCalendarEvents(
+        currentDate.getFullYear(),
+        currentDate.getMonth() + 1
+      );
+      setEvents(response.data);
     } catch (error) {
-      console.error('Failed to fetch calendar events:', error);
+      console.error('Failed to fetch events:', error);
+      // Use empty events if fetch fails
+      setEvents([]);
     } finally {
       setIsLoading(false);
+    }
+  };
+  
+  const isWeekend = (day: number): boolean => {
+    if (!policy) return false;
+    
+    const date = new Date(currentDate.getFullYear(), currentDate.getMonth(), day);
+    const dayOfWeek = date.getDay(); // 0 = Sunday, 6 = Saturday
+    
+    switch (policy.weekly_off_type) {
+      case 'SUNDAY':
+        return dayOfWeek === 0; // Only Sunday
+        
+      case 'SAT_SUN':
+        return dayOfWeek === 0 || dayOfWeek === 6; // Saturday and Sunday
+        
+      case 'ALT_SAT':
+        // All Sundays + 2nd and 4th Saturday
+        if (dayOfWeek === 0) return true; // Sunday
+        if (dayOfWeek === 6) {
+          // Check if it's 2nd or 4th Saturday
+          const weekNumber = Math.ceil(day / 7);
+          return weekNumber === 2 || weekNumber === 4;
+        }
+        return false;
+        
+      default:
+        return false;
+    }
+  };
+  
+  const getWeekendLabel = (): string => {
+    if (!policy) return 'Weekend';
+    
+    switch (policy.weekly_off_type) {
+      case 'SUNDAY':
+        return 'Sunday (Weekend)';
+      case 'SAT_SUN':
+        return 'Sat + Sun (Weekend)';
+      case 'ALT_SAT':
+        return 'Alt Sat + Sun (Weekend)';
+      default:
+        return 'Weekend';
     }
   };
   
@@ -276,6 +289,7 @@ export default function CalendarPage() {
                 {Array.from({ length: daysInMonth }).map((_, index) => {
                   const day = index + 1;
                   const dayEvents = getEventsForDate(day);
+                  const isWeekendDay = isWeekend(day);
                   
                   return (
                     <motion.div
@@ -287,7 +301,9 @@ export default function CalendarPage() {
                         )
                       }
                       className={`h-24 p-1 rounded-lg cursor-pointer transition-colors ${
-                        isToday(day)
+                        isWeekendDay
+                          ? 'bg-gray-200 border border-gray-300'
+                          : isToday(day)
                           ? 'bg-primary-50 border-2 border-primary-500'
                           : isSelected(day)
                           ? 'bg-gray-100'
@@ -297,7 +313,11 @@ export default function CalendarPage() {
                       <div className="flex flex-col h-full">
                         <span
                           className={`text-sm font-medium ${
-                            isToday(day) ? 'text-primary-600' : 'text-gray-900'
+                            isWeekendDay
+                              ? 'text-gray-500'
+                              : isToday(day)
+                              ? 'text-primary-600'
+                              : 'text-gray-900'
                           }`}
                         >
                           {day}
@@ -400,6 +420,10 @@ export default function CalendarPage() {
                 <div className="flex items-center gap-3">
                   <div className="w-3 h-3 rounded-full bg-green-500"></div>
                   <span className="text-sm text-gray-600">Team Event</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="w-4 h-4 rounded bg-gray-300 border border-gray-400"></div>
+                  <span className="text-sm text-gray-600">{getWeekendLabel()}</span>
                 </div>
               </div>
             </div>

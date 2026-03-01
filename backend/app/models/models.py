@@ -34,6 +34,12 @@ class RiskLevel(str, enum.Enum):
     HIGH = "HIGH"
 
 
+class WeeklyOffType(str, enum.Enum):
+    SUNDAY = "SUNDAY"
+    SAT_SUN = "SAT_SUN"
+    ALT_SAT = "ALT_SAT"
+
+
 class User(Base):
     __tablename__ = "users"
     
@@ -87,7 +93,7 @@ class LeavePolicy(Base):
     # Leave allocations per year
     annual_leave_days = Column(Integer, default=22)
     sick_leave_days = Column(Integer, default=10)
-    casual_leave_days = Column(Integer, default=5)
+    casual_leave_days = Column(Integer, default=15)  # Company Policy: 15 days/year
     maternity_leave_days = Column(Integer, default=90)
     paternity_leave_days = Column(Integer, default=15)
     
@@ -102,6 +108,12 @@ class LeavePolicy(Base):
     max_leaves_90_days = Column(Integer, default=10)
     max_pattern_score = Column(Float, default=0.7)
     history_window_days = Column(Integer, default=180)
+    
+    # Weekly/Monthly limits (NEW)
+    max_leaves_per_week = Column(Integer, default=2)  # Max 2 leave requests per week
+    max_leaves_per_month = Column(Integer, default=5)  # Max 5 leave requests per calendar month
+    max_days_per_week = Column(Integer, default=3)  # Max 3 leave days per week
+    max_days_per_month = Column(Integer, default=7)  # Max 7 leave days per calendar month
     
     # Blackout periods (JSON array of {start_date, end_date})
     blackout_periods = Column(JSON, default=[])
@@ -128,6 +140,7 @@ class LeaveRequest(Base):
     end_date = Column(DateTime, nullable=False)
     total_days = Column(Float, nullable=False)
     reason_text = Column(Text, nullable=True)
+    is_emergency = Column(Boolean, default=False)  # Emergency leave flag (bypasses advance notice requirement)
     
     # Medical certificate for sick leave
     medical_certificate_url = Column(String(500), nullable=True)
@@ -163,6 +176,67 @@ class LeaveRequest(Base):
     employee = relationship("User", back_populates="leave_requests", foreign_keys=[employee_id])
     reviewer = relationship("User", foreign_keys=[reviewed_by])
     audit_logs = relationship("LeaveAuditLog", back_populates="leave_request")
+
+
+class MedicalCertificate(Base):
+    __tablename__ = "medical_certificates"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    leave_id = Column(Integer, ForeignKey("leave_requests.id"), nullable=False, unique=True)
+    
+    # File information
+    file_path = Column(String(500), nullable=False)
+    file_name = Column(String(255), nullable=True)
+    file_size = Column(Integer, nullable=True)
+    file_type = Column(String(50), nullable=True)
+    
+    # Raw OCR text - NEVER DELETE
+    extracted_text = Column(Text, nullable=True)
+    
+    # Extracted structured fields - MANDATORY (Detection-Based Approach)
+    # Doctor Information
+    doctor_name_text = Column(String(255), nullable=True)
+    doctor_name_detected = Column(Boolean, default=False)
+    
+    # Clinic Information
+    clinic_name_text = Column(String(255), nullable=True)
+    clinic_name_detected = Column(Boolean, default=False)
+    
+    # Date Information
+    certificate_date = Column(String(50), nullable=True)  # Store as string first
+    date_detected = Column(Boolean, default=False)
+    
+    # Medical Keywords Detection
+    medical_keywords_detected = Column(Boolean, default=False)
+    
+    # Signature/Stamp Detection
+    signature_or_stamp_detected = Column(Boolean, default=False)
+    
+    # Extracted structured fields - OPTIONAL
+    rest_days = Column(Integer, nullable=True)
+    diagnosis = Column(Text, nullable=True)
+    registration_number = Column(String(100), nullable=True)
+    contact_number = Column(String(50), nullable=True)
+    
+    # Confidence engine results
+    confidence_score = Column(Integer, default=0)  # 0-100
+    confidence_level = Column(String(20), nullable=True)  # HIGH, MEDIUM, LOW
+    requires_hr_review = Column(Boolean, default=True)
+    
+    # AI recommendation layer
+    ai_recommendation = Column(String(20), nullable=True)  # APPROVE, REJECT, REVIEW
+    ai_reason = Column(Text, nullable=True)
+    
+    # HR final decision
+    final_status = Column(String(20), nullable=True)  # APPROVED, REJECTED, NULL until HR acts
+    hr_reason = Column(Text, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    # Relationships
+    leave_request = relationship("LeaveRequest", backref="medical_certificate")
 
 
 class LeaveBalance(Base):
@@ -250,3 +324,51 @@ class ApprovalTask(Base):
     # Relationships
     leave_request = relationship("LeaveRequest")
     assignee = relationship("User")
+
+
+class CompanyPolicy(Base):
+    __tablename__ = "company_policy"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    weekly_off_type = Column(Enum(WeeklyOffType), default=WeeklyOffType.SAT_SUN, nullable=False)
+    description = Column(String(255), nullable=True)
+    effective_from = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AIUsageLog(Base):
+    """Tracks Gemini API token consumption for each successful AI call.
+    
+    One row per successful API call. Failed API calls (quota errors, timeouts,
+    invalid responses) are NOT logged here — only calls where usage_metadata
+    is available in the response.
+    """
+    __tablename__ = "ai_usage_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Context — who and what triggered this AI call
+    employee_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    leave_request_id = Column(Integer, ForeignKey("leave_requests.id"), nullable=True, index=True)
+    
+    # What type of call was made
+    call_type = Column(String(50), nullable=False)  # "LEAVE_EVALUATION" | "MEDICAL_CERT"
+    leave_type = Column(String(50), nullable=True)   # e.g. SICK, CASUAL (for filtering)
+    
+    # Model that was used
+    model_name = Column(String(100), nullable=True)
+    
+    # Token counts from Gemini response.usage_metadata
+    prompt_tokens = Column(Integer, default=0, nullable=False)
+    output_tokens = Column(Integer, default=0, nullable=False)
+    total_tokens = Column(Integer, default=0, nullable=False)
+    
+    # Outcome of the AI call (for correlation analysis)
+    ai_recommended_action = Column(String(50), nullable=True)  # APPROVE | REJECT | MANUAL_REVIEW
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    
+    # Relationships
+    employee = relationship("User", foreign_keys=[employee_id])
+    leave_request = relationship("LeaveRequest", foreign_keys=[leave_request_id])

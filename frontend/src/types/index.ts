@@ -32,6 +32,7 @@ export interface LeaveRequest {
   end_date: string;
   total_days: number;
   days_requested: number;
+  is_emergency?: boolean;
   reason_text: string | null;
   medical_certificate_url: string | null;
   medical_certificate_filename: string | null;

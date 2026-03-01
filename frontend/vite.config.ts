@@ -10,6 +10,9 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  optimizeDeps: {
+    include: ['recharts', 'react-is'],
+  },
   server: {
     port: 5173,
     proxy: {
@@ -20,3 +23,4 @@ export default defineConfig({
     },
   },
 })
+

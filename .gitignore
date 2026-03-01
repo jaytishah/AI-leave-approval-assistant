@@ -13,6 +13,14 @@
 !tsconfig.node.json
 !postcss.config.js
 !tailwind.config.js
+!vite.config.ts
+
+# API Keys & Credentials
+*api*key*
+*apikey*
+credentials.json
+secrets.json
+config.prod.json
 
 # GCP / Service Account keys
 document-ai-sa.json
@@ -64,12 +72,22 @@ Thumbs.db
 logs/
 tmp/
 temp/
+*.tmp
+
+# Uploads & User Content
+uploads/*
+!uploads/.gitignore
+medical_certificates/
+user_uploads/
 
 # ========================
 # Database
 # ========================
 *.db
 *.sqlite3
+*.sql
+!schema.sql
+!migrations/*.sql
 
 # ========================
 # OS Files

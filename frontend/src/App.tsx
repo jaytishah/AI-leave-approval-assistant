@@ -5,11 +5,13 @@ import { DashboardLayout } from '@/components/layout/DashboardLayout';
 import LoginPage from '@/pages/LoginPage';
 import EmployeeDashboardPage from '@/pages/employee/EmployeeDashboardPage';
 import MyRequestsPage from '@/pages/employee/MyRequestsPage';
-import CalendarPage from '@/pages/employee/CalendarPage';
+import CalendarPage from '@/pages/shared/CalendarPage';
 import HRDashboardPage from '@/pages/hr/HRDashboardPage';
 import LeaveRequestDetailPage from '@/pages/hr/LeaveRequestDetailPage';
 import AdminDashboardPage from '@/pages/admin/AdminDashboardPage';
+import PolicySettingsPage from '@/pages/admin/PolicySettingsPage';
 import SettingsPage from '@/pages/SettingsPage';
+import AllPendingRequestsPage from '@/pages/hr/AllPendingRequestsPage';
 
 // Protected Route Component
 interface ProtectedRouteProps {
@@ -153,11 +155,31 @@ function App() {
           }
         />
         <Route
+          path="/hr/calendar"
+          element={
+            <ProtectedRoute allowedRoles={['HR', 'ADMIN']}>
+              <DashboardLayout>
+                <CalendarPage />
+              </DashboardLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
           path="/hr/requests/:id"
           element={
             <ProtectedRoute allowedRoles={['HR', 'ADMIN']}>
               <DashboardLayout>
                 <LeaveRequestDetailPage />
+              </DashboardLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/hr/all-pending-requests"
+          element={
+            <ProtectedRoute allowedRoles={["HR", "ADMIN"]}>
+              <DashboardLayout>
+                <AllPendingRequestsPage />
               </DashboardLayout>
             </ProtectedRoute>
           }
@@ -170,6 +192,26 @@ function App() {
             <ProtectedRoute allowedRoles={['ADMIN']}>
               <DashboardLayout>
                 <AdminDashboardPage />
+              </DashboardLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/calendar"
+          element={
+            <ProtectedRoute allowedRoles={['ADMIN']}>
+              <DashboardLayout>
+                <CalendarPage />
+              </DashboardLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/policy-settings"
+          element={
+            <ProtectedRoute allowedRoles={['ADMIN']}>
+              <DashboardLayout>
+                <PolicySettingsPage />
               </DashboardLayout>
             </ProtectedRoute>
           }

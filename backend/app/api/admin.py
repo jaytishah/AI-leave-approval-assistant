@@ -7,14 +7,17 @@ from datetime import datetime, timedelta
 from app.core import get_db
 from app.models import (
     User, UserRole, LeaveRequest, LeaveStatus, LeaveBalance,
-    LeaveAuditLog, Department, LeavePolicy, Holiday, AIConfiguration
+    LeaveAuditLog, Department, LeavePolicy, Holiday, AIConfiguration,
+    CompanyPolicy, WeeklyOffType, AIUsageLog
 )
 from app.schemas import (
     LeavePolicyCreate, LeavePolicyUpdate, LeavePolicyResponse,
     AIConfigCreate, AIConfigUpdate, AIConfigResponse,
     HolidayCreate, HolidayResponse, AuditLogResponse,
     DashboardStats, EmployeeDashboard, HRDashboard, AdminDashboard,
-    LeaveBalanceResponse, LeaveRequestResponse, LeaveRequestWithEmployee
+    LeaveBalanceResponse, LeaveRequestResponse, LeaveRequestWithEmployee,
+    CompanyPolicyUpdate, CompanyPolicyResponse,
+    AIUsageSummary, AIUsagePerEmployee, AIUsageDailyPoint, AIUsageByCallType
 )
 from app.api.auth import get_current_user, require_role
 
@@ -104,6 +107,32 @@ async def get_hr_dashboard(
             employee_avatar=employee.avatar_url if employee else None
         ))
     
+    # Get upcoming approved leaves (Today, Tomorrow, Next 7 days)
+    today = datetime.now().date()
+    next_7_days = today + timedelta(days=7)
+    
+    upcoming_leaves_query = db.query(LeaveRequest).filter(
+        LeaveRequest.status == LeaveStatus.APPROVED,
+        LeaveRequest.start_date <= next_7_days,
+        LeaveRequest.end_date >= today
+    ).order_by(LeaveRequest.start_date).all()
+    
+    upcoming_leaves = []
+    for leave in upcoming_leaves_query:
+        employee = db.query(User).filter(User.id == leave.employee_id).first()
+        upcoming_leaves.append({
+            "id": leave.id,
+            "employee_name": f"{employee.first_name} {employee.last_name}" if employee else "Unknown",
+            "employee_email": employee.email if employee else "",
+            "employee_department": employee.department.name if employee and employee.department else None,
+            "leave_type": leave.leave_type.value,
+            "start_date": leave.start_date.strftime("%Y-%m-%d"),
+            "end_date": leave.end_date.strftime("%Y-%m-%d"),
+            "total_days": leave.total_days,
+            "is_today": leave.start_date <= datetime.now() and leave.end_date >= datetime.now(),
+            "is_tomorrow": leave.start_date.date() == today + timedelta(days=1)
+        })
+    
     return HRDashboard(
         stats=DashboardStats(
             total_pending=total_pending,
@@ -111,7 +140,8 @@ async def get_hr_dashboard(
             team_coverage=94.0,  # Calculate based on team availability
             pending_change_percent=round(pending_change, 1)
         ),
-        pending_requests=result_requests
+        pending_requests=result_requests,
+        upcoming_leaves=upcoming_leaves
     )
 
 
@@ -535,3 +565,313 @@ def _generate_ai_suggestion(user: User, balances: List[LeaveBalance], db: Sessio
             return f"Our AI suggests you've worked {days_since_leave} days without a break. Stress levels might be higher than usual. Consider taking some time off!"
     
     return None
+
+
+# ========== Company Policy Routes ==========
+
+@router.get("/policy", response_model=CompanyPolicyResponse)
+async def get_company_policy(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current company policy settings - accessible to all authenticated users"""
+    policy = db.query(CompanyPolicy).order_by(CompanyPolicy.updated_at.desc()).first()
+    
+    if not policy:
+        # Create default policy if none exists
+        policy = CompanyPolicy(
+            weekly_off_type=WeeklyOffType.SAT_SUN,
+            description="Default policy: Saturday and Sunday weekly off",
+            effective_from=datetime.now()
+        )
+        db.add(policy)
+        db.commit()
+        db.refresh(policy)
+    
+    return CompanyPolicyResponse(
+        id=policy.id,
+        weekly_off_type=policy.weekly_off_type.value,
+        description=policy.description,
+        effective_from=policy.effective_from,
+        updated_at=policy.updated_at
+    )
+
+
+@router.put("/policy", response_model=CompanyPolicyResponse)
+async def update_company_policy(
+    policy_data: CompanyPolicyUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.ADMIN))
+):
+    """Update company policy settings - Admin only"""
+    # Validate weekly_off_type
+    try:
+        weekly_off_enum = WeeklyOffType(policy_data.weekly_off_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid weekly_off_type. Must be one of: SUNDAY, SAT_SUN, ALT_SAT"
+        )
+    
+    # Get or create policy
+    policy = db.query(CompanyPolicy).order_by(CompanyPolicy.updated_at.desc()).first()
+    
+    if not policy:
+        policy = CompanyPolicy()
+        db.add(policy)
+    
+    policy.weekly_off_type = weekly_off_enum
+    policy.description = policy_data.description or f"Weekly off type: {policy_data.weekly_off_type}"
+    policy.effective_from = datetime.now()
+    
+    db.commit()
+    db.refresh(policy)
+    
+    return CompanyPolicyResponse(
+        id=policy.id,
+        weekly_off_type=policy.weekly_off_type.value,
+        description=policy.description,
+        effective_from=policy.effective_from,
+        updated_at=policy.updated_at
+    )
+
+
+# ========== Working Days Calculation API ==========
+
+@router.post("/calculate-working-days", response_model=dict)
+async def calculate_working_days_api(
+    start_date: str,
+    end_date: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Calculate working days between two dates based on company policy.
+    Returns detailed breakdown of working days, weekends, and holidays.
+    """
+    from app.services.leave_utils import calculate_working_days_detailed
+    from datetime import datetime
+    
+    # Parse dates
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD"
+        )
+    
+    # Validate dates
+    if start > end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_date cannot be after end_date"
+        )
+    
+    # Get company policy
+    policy = db.query(CompanyPolicy).order_by(CompanyPolicy.updated_at.desc()).first()
+    weekly_off_type = policy.weekly_off_type.value if policy else "SAT_SUN"
+    
+    # Get holidays in the date range
+    holidays = db.query(Holiday).filter(
+        Holiday.date >= start,
+        Holiday.date <= end,
+        Holiday.is_active == True
+    ).all()
+    
+    holiday_dates = [h.date for h in holidays]
+    
+    # Calculate working days
+    result = calculate_working_days_detailed(start, end, weekly_off_type, holiday_dates)
+    
+    # Add policy info
+    result["policy"] = {
+        "weekly_off_type": weekly_off_type,
+        "description": policy.description if policy else "Default: Saturday and Sunday off"
+    }
+    
+    return result
+
+
+# ========== AI Analytics (READ-ONLY, never touches approval logic) ==========
+
+@router.get("/ai-analytics/summary", response_model=AIUsageSummary)
+async def get_ai_usage_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(require_role(UserRole.HR, UserRole.ADMIN)),
+    db: Session = Depends(get_db)
+):
+    """Global Gemini API usage summary (tokens, requests, today/month breakdown)."""
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    base_q = db.query(AIUsageLog)
+    if start_date:
+        try:
+            base_q = base_q.filter(AIUsageLog.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            base_q = base_q.filter(AIUsageLog.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+        except ValueError:
+            pass
+    
+    # All-time (or within filter range)
+    totals = base_q.with_entities(
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AIUsageLog.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AIUsageLog.output_tokens), 0).label("output_tokens"),
+        func.count(AIUsageLog.id).label("total_requests")
+    ).first()
+    
+    # Today
+    today_totals = db.query(AIUsageLog).filter(
+        AIUsageLog.created_at >= today_start
+    ).with_entities(
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("tokens"),
+        func.count(AIUsageLog.id).label("requests")
+    ).first()
+    
+    # This month
+    month_totals = db.query(AIUsageLog).filter(
+        AIUsageLog.created_at >= month_start
+    ).with_entities(
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("tokens"),
+        func.count(AIUsageLog.id).label("requests")
+    ).first()
+    
+    return AIUsageSummary(
+        total_tokens=int(totals.total_tokens or 0),
+        total_requests=int(totals.total_requests or 0),
+        prompt_tokens=int(totals.prompt_tokens or 0),
+        output_tokens=int(totals.output_tokens or 0),
+        tokens_today=int(today_totals.tokens or 0) if today_totals else 0,
+        requests_today=int(today_totals.requests or 0) if today_totals else 0,
+        tokens_this_month=int(month_totals.tokens or 0) if month_totals else 0,
+        requests_this_month=int(month_totals.requests or 0) if month_totals else 0,
+    )
+
+
+@router.get("/ai-analytics/per-employee", response_model=List[AIUsagePerEmployee])
+async def get_ai_usage_per_employee(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    leave_type: Optional[str] = None,
+    current_user: User = Depends(require_role(UserRole.HR, UserRole.ADMIN)),
+    db: Session = Depends(get_db)
+):
+    """Token usage breakdown grouped by employee."""
+    q = db.query(
+        AIUsageLog.employee_id,
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AIUsageLog.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AIUsageLog.output_tokens), 0).label("output_tokens"),
+        func.count(AIUsageLog.id).label("total_requests"),
+        func.max(AIUsageLog.created_at).label("last_request_at")
+    ).filter(AIUsageLog.employee_id.isnot(None))
+    
+    if start_date:
+        try:
+            q = q.filter(AIUsageLog.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            q = q.filter(AIUsageLog.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+        except ValueError:
+            pass
+    if leave_type:
+        q = q.filter(AIUsageLog.leave_type == leave_type.upper())
+    
+    rows = q.group_by(AIUsageLog.employee_id).order_by(
+        func.sum(AIUsageLog.total_tokens).desc()
+    ).all()
+    
+    result = []
+    for row in rows:
+        employee = db.query(User).filter(User.id == row.employee_id).first()
+        result.append(AIUsagePerEmployee(
+            employee_id=row.employee_id,
+            employee_name=f"{employee.first_name} {employee.last_name}" if employee else f"Employee #{row.employee_id}",
+            department=employee.department.name if employee and employee.department else None,
+            total_tokens=int(row.total_tokens or 0),
+            prompt_tokens=int(row.prompt_tokens or 0),
+            output_tokens=int(row.output_tokens or 0),
+            total_requests=int(row.total_requests or 0),
+            last_request_at=row.last_request_at
+        ))
+    return result
+
+
+@router.get("/ai-analytics/daily", response_model=List[AIUsageDailyPoint])
+async def get_ai_usage_daily(
+    days: int = Query(default=30, ge=1, le=365),
+    current_user: User = Depends(require_role(UserRole.HR, UserRole.ADMIN)),
+    db: Session = Depends(get_db)
+):
+    """Daily token consumption trend over the last N days."""
+    start_from = datetime.now() - timedelta(days=days)
+    
+    rows = db.query(
+        func.date(AIUsageLog.created_at).label("day"),
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("total_tokens"),
+        func.coalesce(func.sum(AIUsageLog.prompt_tokens), 0).label("prompt_tokens"),
+        func.coalesce(func.sum(AIUsageLog.output_tokens), 0).label("output_tokens"),
+        func.count(AIUsageLog.id).label("requests")
+    ).filter(
+        AIUsageLog.created_at >= start_from
+    ).group_by(
+        func.date(AIUsageLog.created_at)
+    ).order_by(
+        func.date(AIUsageLog.created_at).asc()
+    ).all()
+    
+    return [
+        AIUsageDailyPoint(
+            date=str(row.day),
+            total_tokens=int(row.total_tokens or 0),
+            prompt_tokens=int(row.prompt_tokens or 0),
+            output_tokens=int(row.output_tokens or 0),
+            requests=int(row.requests or 0)
+        )
+        for row in rows
+    ]
+
+
+@router.get("/ai-analytics/by-call-type", response_model=List[AIUsageByCallType])
+async def get_ai_usage_by_call_type(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(require_role(UserRole.HR, UserRole.ADMIN)),
+    db: Session = Depends(get_db)
+):
+    """Token consumption split by call type (for pie/donut chart)."""
+    q = db.query(
+        AIUsageLog.call_type,
+        func.coalesce(func.sum(AIUsageLog.total_tokens), 0).label("total_tokens"),
+        func.count(AIUsageLog.id).label("requests")
+    )
+    if start_date:
+        try:
+            q = q.filter(AIUsageLog.created_at >= datetime.strptime(start_date, "%Y-%m-%d"))
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            q = q.filter(AIUsageLog.created_at < datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1))
+        except ValueError:
+            pass
+    
+    rows = q.group_by(AIUsageLog.call_type).all()
+    return [
+        AIUsageByCallType(
+            call_type=row.call_type,
+            total_tokens=int(row.total_tokens or 0),
+            requests=int(row.requests or 0)
+        )
+        for row in rows
+    ]

@@ -169,7 +169,7 @@ def seed_database():
             department_id=None,
             annual_leave_days=22,
             sick_leave_days=10,
-            casual_leave_days=5,
+            casual_leave_days=15,
             maternity_leave_days=90,
             paternity_leave_days=15,
             allow_negative_balance=False,

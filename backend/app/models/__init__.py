@@ -7,12 +7,16 @@ from app.models.models import (
     LeaveRequest,
     LeaveStatus,
     LeaveType,
+    MedicalCertificate,
     LeaveBalance,
     LeaveAuditLog,
     AIConfiguration,
     Holiday,
     ApprovalTask,
-    RiskLevel
+    RiskLevel,
+    CompanyPolicy,
+    WeeklyOffType,
+    AIUsageLog
 )
 
 __all__ = [
@@ -24,10 +28,14 @@ __all__ = [
     "LeaveRequest",
     "LeaveStatus",
     "LeaveType",
+    "MedicalCertificate",
     "LeaveBalance",
     "LeaveAuditLog",
     "AIConfiguration",
     "Holiday",
     "ApprovalTask",
-    "RiskLevel"
+    "RiskLevel",
+    "CompanyPolicy",
+    "WeeklyOffType",
+    "AIUsageLog"
 ]

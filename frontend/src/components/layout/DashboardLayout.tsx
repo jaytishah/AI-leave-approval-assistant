@@ -13,6 +13,7 @@ import {
   Menu,
   X,
   Sparkles,
+  Briefcase,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
 import { Avatar } from '@/components/ui';
@@ -30,11 +31,14 @@ const navItems: NavItem[] = [
   { icon: LayoutDashboard, label: 'Dashboard', path: '/dashboard', roles: ['EMPLOYEE'] },
   { icon: FileText, label: 'My Requests', path: '/my-requests', roles: ['EMPLOYEE'] },
   { icon: Calendar, label: 'Calendar', path: '/calendar', roles: ['EMPLOYEE'] },
-  // HR sees HR Dashboard
+  // HR sees HR Dashboard and Calendar
   { icon: LayoutDashboard, label: 'HR Dashboard', path: '/hr', roles: ['HR'] },
-  // Admin sees Admin Dashboard and HR Dashboard
+  { icon: Calendar, label: 'Calendar', path: '/hr/calendar', roles: ['HR'] },
+  // Admin sees Admin Dashboard, HR Dashboard, Policy Settings, and Calendar
   { icon: LayoutDashboard, label: 'Admin Dashboard', path: '/admin', roles: ['ADMIN'] },
   { icon: FileText, label: 'HR Dashboard', path: '/hr', roles: ['ADMIN'] },
+  { icon: Briefcase, label: 'Policy Settings', path: '/admin/policy-settings', roles: ['ADMIN'] },
+  { icon: Calendar, label: 'Calendar', path: '/admin/calendar', roles: ['ADMIN'] },
   // Settings for all
   { icon: Settings, label: 'Settings', path: '/settings' },
 ];

@@ -161,6 +161,7 @@ class LeaveRequestBase(BaseModel):
     start_date: datetime
     end_date: datetime
     reason_text: Optional[str] = None
+    is_emergency: Optional[bool] = False
     medical_certificate_url: Optional[str] = None
     medical_certificate_filename: Optional[str] = None
     medical_certificate_size: Optional[int] = None
@@ -301,7 +302,7 @@ class LeavePolicyBase(BaseModel):
     grade: Optional[str] = None
     annual_leave_days: int = 22
     sick_leave_days: int = 10
-    casual_leave_days: int = 5
+    casual_leave_days: int = 15  # Company Policy: 15 days/year
     maternity_leave_days: int = 90
     paternity_leave_days: int = 15
     allow_negative_balance: bool = False
@@ -314,6 +315,11 @@ class LeavePolicyBase(BaseModel):
     max_leaves_90_days: int = 10
     max_pattern_score: float = 0.7
     history_window_days: int = 180
+    # Weekly and monthly limits
+    max_leaves_per_week: int = 2
+    max_leaves_per_month: int = 5
+    max_days_per_week: int = 3
+    max_days_per_month: int = 7
 
 
 class LeavePolicyCreate(LeavePolicyBase):
@@ -335,6 +341,10 @@ class LeavePolicyUpdate(BaseModel):
     max_unplanned_leaves_30_days: Optional[int] = None
     max_leaves_90_days: Optional[int] = None
     max_pattern_score: Optional[float] = None
+    max_leaves_per_week: Optional[int] = None
+    max_leaves_per_month: Optional[int] = None
+    max_days_per_week: Optional[int] = None
+    max_days_per_month: Optional[int] = None
     blackout_periods: Optional[List[dict]] = None
     holidays: Optional[List[str]] = None
     is_active: Optional[bool] = None
@@ -397,7 +407,7 @@ class AuditLogResponse(BaseModel):
     previous_status: Optional[str]
     new_status: Optional[str]
     details: Optional[str]
-    metadata: Optional[dict]
+    extra_data: Optional[dict] = None
     created_at: datetime
     
     class Config:
@@ -445,6 +455,7 @@ class EmployeeDashboard(BaseModel):
 class HRDashboard(BaseModel):
     stats: DashboardStats
     pending_requests: List[LeaveRequestWithEmployee]
+    upcoming_leaves: Optional[List[dict]] = []  # Leaves for today/tomorrow/next 7 days
 
 
 class AdminDashboard(BaseModel):
@@ -482,3 +493,67 @@ class LeaveStats(BaseModel):
     friday_leaves_last_90_days: int = 0
     monday_friday_pattern_score: float = 0
     risk_level: str = "LOW"
+
+
+# ========== Company Policy Schemas ==========
+
+class CompanyPolicyUpdate(BaseModel):
+    weekly_off_type: str
+    description: Optional[str] = None
+
+
+class CompanyPolicyResponse(BaseModel):
+    id: int
+    weekly_off_type: str
+    description: Optional[str] = None
+    effective_from: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
+
+# ========== AI Analytics Schemas ==========
+
+class AIUsageSummary(BaseModel):
+    """Global Gemini API usage summary."""
+    total_tokens: int = 0
+    total_requests: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    tokens_today: int = 0
+    requests_today: int = 0
+    tokens_this_month: int = 0
+    requests_this_month: int = 0
+
+
+class AIUsagePerEmployee(BaseModel):
+    """Token usage breakdown per employee."""
+    employee_id: int
+    employee_name: str
+    department: Optional[str] = None
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    total_requests: int = 0
+    last_request_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AIUsageDailyPoint(BaseModel):
+    """Single data point for the daily token consumption line chart."""
+    date: str                # ISO date string, e.g. "2026-02-27"
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    requests: int = 0
+
+
+class AIUsageByCallType(BaseModel):
+    """Token distribution by call type (for pie chart)."""
+    call_type: str
+    total_tokens: int = 0
+    requests: int = 0
+

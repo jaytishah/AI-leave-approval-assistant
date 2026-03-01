@@ -23,22 +23,31 @@ import toast from 'react-hot-toast';
 import { leaveApi } from '@/services/api';
 import { Card, Badge, Button, Avatar, Modal } from '@/components/ui';
 
-// Medical Certificate Validation interface
+// Medical Certificate Validation interface - Updated for Steps 3-5
 interface MedicalCertificateValidation {
-  is_valid: boolean | null;
-  result: 'VALID' | 'INVALID' | 'NEEDS_REVIEW' | 'EXTRACTION_FAILED';
-  confidence_score: number;
-  detected_fields: {
-    date?: string;
-    patient_name?: string;
-    doctor_name?: string;
-    hospital?: string;
-    diagnosis?: string;
-    leave_days?: string;
-    registration_no?: string;
-  };
-  validation_notes: string[];
-  extracted_text_preview: string | null;
+  // Step 3: Structured Field Extraction
+  doctor_name_text?: string | null;
+  clinic_name_text?: string | null;
+  certificate_date?: string | null;
+  rest_days?: string | null;
+  diagnosis?: string | null;
+  registration_number?: string | null;
+  contact_number?: string | null;
+  extracted_text?: string | null;
+  
+  // Step 4: Confidence Engine
+  confidence_score?: number | null;
+  confidence_level?: 'HIGH' | 'MEDIUM' | 'LOW' | null;
+  requires_hr_review?: boolean;
+  
+  // Step 5: AI Recommendation
+  ai_recommendation?: 'APPROVE' | 'REVIEW' | 'REJECT' | null;
+  ai_reason?: string | null;
+  
+  // Legacy fields (for backward compatibility)
+  result?: 'VALID' | 'INVALID' | 'NEEDS_REVIEW' | 'EXTRACTION_FAILED';
+  detected_fields?: any;
+  validation_notes?: string[];
   error?: string;
 }
 
@@ -340,18 +349,18 @@ export default function LeaveRequestDetailPage() {
                       <Stethoscope className="w-5 h-5 text-blue-500" />
                       <h2 className="text-lg font-semibold text-gray-900">Medical Certificate</h2>
                     </div>
-                    {request.medical_certificate_validation && (
+                    {request.medical_certificate_validation?.confidence_level && (
                       <Badge 
                         variant={
-                          request.medical_certificate_validation.result === 'VALID' ? 'success' :
-                          request.medical_certificate_validation.result === 'NEEDS_REVIEW' ? 'warning' :
-                          request.medical_certificate_validation.result === 'INVALID' ? 'danger' : 'default'
+                          request.medical_certificate_validation.confidence_level === 'HIGH' ? 'success' :
+                          request.medical_certificate_validation.confidence_level === 'MEDIUM' ? 'warning' :
+                          'danger'
                         }
                       >
-                        {request.medical_certificate_validation.result === 'VALID' && <CheckCircle className="w-3 h-3 mr-1" />}
-                        {request.medical_certificate_validation.result === 'NEEDS_REVIEW' && <AlertTriangle className="w-3 h-3 mr-1" />}
-                        {request.medical_certificate_validation.result === 'INVALID' && <XCircle className="w-3 h-3 mr-1" />}
-                        {request.medical_certificate_validation.result.replace('_', ' ')}
+                        {request.medical_certificate_validation.confidence_level === 'HIGH' && <CheckCircle className="w-3 h-3 mr-1" />}
+                        {request.medical_certificate_validation.confidence_level === 'MEDIUM' && <AlertTriangle className="w-3 h-3 mr-1" />}
+                        {request.medical_certificate_validation.confidence_level === 'LOW' && <XCircle className="w-3 h-3 mr-1" />}
+                        {request.medical_certificate_validation.confidence_level} Confidence
                       </Badge>
                     )}
                   </div>
@@ -398,104 +407,167 @@ export default function LeaveRequestDetailPage() {
                     </div>
                   </div>
                   
-                  {/* Validation Results */}
+                  {/* Step 3-5 Validation Results */}
                   {request.medical_certificate_validation && (
                     <div className="space-y-4">
-                      {/* Confidence Score */}
-                      <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                        <span className="text-sm font-medium text-gray-700">Validation Confidence</span>
-                        <div className="flex items-center gap-2">
-                          <div className="w-32 h-2 bg-gray-200 rounded-full overflow-hidden">
-                            <div 
-                              className={`h-full rounded-full ${
-                                request.medical_certificate_validation.confidence_score >= 0.7 ? 'bg-green-500' :
-                                request.medical_certificate_validation.confidence_score >= 0.4 ? 'bg-amber-500' : 'bg-red-500'
-                              }`}
-                              style={{ width: `${request.medical_certificate_validation.confidence_score * 100}%` }}
-                            />
+                      {/* Extracted Information (Step 3) */}
+                      <div className="p-4 bg-white border border-gray-200 rounded-lg">
+                        <div className="flex items-center gap-2 mb-3">
+                          <FileText className="w-4 h-4 text-blue-600" />
+                          <h4 className="font-medium text-gray-900">Extracted Information</h4>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Doctor Name</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.doctor_name_text || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
                           </div>
-                          <span className="font-semibold text-gray-900">
-                            {Math.round(request.medical_certificate_validation.confidence_score * 100)}%
-                          </span>
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Clinic/Hospital</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.clinic_name_text || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Certificate Date</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.certificate_date || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Rest Days Recommended</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.rest_days || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Diagnosis</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.diagnosis || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-xs text-gray-500 uppercase mb-1">Registration Number</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.registration_number || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
+                          <div className="col-span-2">
+                            <p className="text-xs text-gray-500 uppercase mb-1">Contact Number</p>
+                            <p className="text-sm font-medium text-gray-900">
+                              {request.medical_certificate_validation.contact_number || <span className="text-gray-400 italic">Not detected</span>}
+                            </p>
+                          </div>
                         </div>
                       </div>
-                      
-                      {/* Detected Fields */}
-                      {request.medical_certificate_validation.detected_fields && 
-                       Object.keys(request.medical_certificate_validation.detected_fields).length > 0 && (
-                        <div className="p-4 bg-green-50 rounded-lg">
+
+                      {/* Validation Summary (Step 4) */}
+                      <div className={`p-4 rounded-lg ${
+                        request.medical_certificate_validation.confidence_level === 'HIGH' ? 'bg-green-50' :
+                        request.medical_certificate_validation.confidence_level === 'MEDIUM' ? 'bg-amber-50' :
+                        'bg-red-50'
+                      }`}>
+                        <div className="flex items-center gap-2 mb-3">
+                          <Shield className={`w-4 h-4 ${
+                            request.medical_certificate_validation.confidence_level === 'HIGH' ? 'text-green-600' :
+                            request.medical_certificate_validation.confidence_level === 'MEDIUM' ? 'text-amber-600' :
+                            'text-red-600'
+                          }`} />
+                          <h4 className={`font-medium ${
+                            request.medical_certificate_validation.confidence_level === 'HIGH' ? 'text-green-800' :
+                            request.medical_certificate_validation.confidence_level === 'MEDIUM' ? 'text-amber-800' :
+                            'text-red-800'
+                          }`}>
+                            Validation Summary
+                          </h4>
+                        </div>
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-gray-700">Confidence Score</span>
+                            <div className="flex items-center gap-3">
+                              <div className="w-32 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                <div 
+                                  className={`h-full rounded-full ${
+                                    request.medical_certificate_validation.confidence_level === 'HIGH' ? 'bg-green-500' :
+                                    request.medical_certificate_validation.confidence_level === 'MEDIUM' ? 'bg-amber-500' :
+                                    'bg-red-500'
+                                  }`}
+                                  style={{ width: `${request.medical_certificate_validation.confidence_score || 0}%` }}
+                                />
+                              </div>
+                              <span className="font-semibold text-gray-900 w-12 text-right">
+                                {request.medical_certificate_validation.confidence_score || 0}/100
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-gray-700">Confidence Level</span>
+                            <span className="font-medium text-gray-900">
+                              {request.medical_certificate_validation.confidence_level || 'Unknown'}
+                            </span>
+                          </div>
+                          {request.medical_certificate_validation.confidence_level === 'LOW' && (
+                            <div className="mt-3 p-3 bg-red-100 border border-red-200 rounded-lg">
+                              <div className="flex items-start gap-2">
+                                <AlertTriangle className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5" />
+                                <p className="text-sm text-red-800">
+                                  <strong>Manual review required:</strong> This certificate has low confidence due to missing or unclear information. Please review carefully before making a decision.
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* AI Advisory (Step 5) */}
+                      {request.medical_certificate_validation.ai_recommendation && (
+                        <div className="p-4 bg-purple-50 border border-purple-200 rounded-lg">
                           <div className="flex items-center gap-2 mb-3">
-                            <CheckCircle className="w-4 h-4 text-green-600" />
-                            <h4 className="font-medium text-green-800">Extracted Information</h4>
+                            <Brain className="w-4 h-4 text-purple-600" />
+                            <h4 className="font-medium text-purple-900">AI Advisory</h4>
                           </div>
-                          <div className="grid grid-cols-2 gap-3">
-                            {request.medical_certificate_validation.detected_fields.doctor_name && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Doctor Name</p>
-                                <p className="text-sm font-medium text-gray-900 capitalize">
-                                  {request.medical_certificate_validation.detected_fields.doctor_name}
-                                </p>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm text-gray-700">Recommendation</span>
+                              <div className="flex items-center gap-2">
+                                {request.medical_certificate_validation.ai_recommendation === 'APPROVE' ? (
+                                  <CheckCircle className="w-4 h-4 text-green-500" />
+                                ) : request.medical_certificate_validation.ai_recommendation === 'REJECT' ? (
+                                  <XCircle className="w-4 h-4 text-red-500" />
+                                ) : (
+                                  <AlertTriangle className="w-4 h-4 text-amber-500" />
+                                )}
+                                <span className={`font-medium px-3 py-1 rounded-full text-xs ${
+                                  request.medical_certificate_validation.ai_recommendation === 'APPROVE' ? 'bg-green-100 text-green-800' :
+                                  request.medical_certificate_validation.ai_recommendation === 'REJECT' ? 'bg-red-100 text-red-800' :
+                                  'bg-amber-100 text-amber-800'
+                                }`}>
+                                  {request.medical_certificate_validation.ai_recommendation}
+                                </span>
                               </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.date && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Date</p>
-                                <p className="text-sm font-medium text-gray-900">
-                                  {request.medical_certificate_validation.detected_fields.date}
-                                </p>
-                              </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.diagnosis && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Diagnosis</p>
-                                <p className="text-sm font-medium text-gray-900 capitalize">
-                                  {request.medical_certificate_validation.detected_fields.diagnosis}
-                                </p>
-                              </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.hospital && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Hospital/Clinic</p>
-                                <p className="text-sm font-medium text-gray-900 capitalize">
-                                  {request.medical_certificate_validation.detected_fields.hospital}
-                                </p>
-                              </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.patient_name && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Patient Name</p>
-                                <p className="text-sm font-medium text-gray-900 capitalize">
-                                  {request.medical_certificate_validation.detected_fields.patient_name}
-                                </p>
-                              </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.registration_no && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Registration No</p>
-                                <p className="text-sm font-medium text-gray-900 uppercase">
-                                  {request.medical_certificate_validation.detected_fields.registration_no}
-                                </p>
-                              </div>
-                            )}
-                            {request.medical_certificate_validation.detected_fields.leave_days && (
-                              <div>
-                                <p className="text-xs text-gray-500 uppercase">Recommended Leave</p>
-                                <p className="text-sm font-medium text-gray-900">
-                                  {request.medical_certificate_validation.detected_fields.leave_days}
+                            </div>
+                            {request.medical_certificate_validation.ai_reason && (
+                              <div className="mt-3 p-3 bg-white rounded border border-purple-100">
+                                <p className="text-sm text-gray-700 leading-relaxed">
+                                  {request.medical_certificate_validation.ai_reason}
                                 </p>
                               </div>
                             )}
                           </div>
+                          <p className="text-xs text-purple-600 mt-3 italic">
+                            ℹ️ This is an AI-powered advisory. Final decision should be made by HR based on all available information.
+                          </p>
                         </div>
                       )}
                       
-                      {/* Extracted Text Preview */}
-                      {request.medical_certificate_validation.extracted_text_preview && (
+                      {/* Extracted Text - Collapsible */}
+                      {request.medical_certificate_validation.extracted_text && (
                         <div className="p-4 bg-gray-50 rounded-lg">
                           <div className="flex items-center justify-between mb-2">
                             <div className="flex items-center gap-2">
                               <FileText className="w-4 h-4 text-gray-500" />
-                              <h4 className="font-medium text-gray-700">Extracted Text Preview</h4>
+                              <h4 className="font-medium text-gray-700">Extracted Text</h4>
                             </div>
                             <Button 
                               variant="ghost" 
@@ -505,40 +577,10 @@ export default function LeaveRequestDetailPage() {
                               View Full Text
                             </Button>
                           </div>
-                          <p className="text-sm text-gray-600 bg-white p-3 rounded border border-gray-200 font-mono whitespace-pre-wrap">
-                            {request.medical_certificate_validation.extracted_text_preview.substring(0, 200)}
-                            {request.medical_certificate_validation.extracted_text_preview.length > 200 && '...'}
+                          <p className="text-sm text-gray-600 bg-white p-3 rounded border border-gray-200 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
+                            {request.medical_certificate_validation.extracted_text.substring(0, 300)}
+                            {request.medical_certificate_validation.extracted_text.length > 300 && '...'}
                           </p>
-                        </div>
-                      )}
-                      
-                      {/* Validation Notes */}
-                      {request.medical_certificate_validation.validation_notes && 
-                       request.medical_certificate_validation.validation_notes.length > 0 && (
-                        <div className="p-4 bg-amber-50 rounded-lg">
-                          <div className="flex items-center gap-2 mb-2">
-                            <AlertTriangle className="w-4 h-4 text-amber-600" />
-                            <h4 className="font-medium text-amber-800">Validation Notes</h4>
-                          </div>
-                          <ul className="space-y-1">
-                            {request.medical_certificate_validation.validation_notes.map((note, index) => (
-                              <li key={index} className="text-sm text-amber-700 flex items-start gap-2">
-                                <span className="text-amber-400">•</span>
-                                {note}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      
-                      {/* Error Message */}
-                      {request.medical_certificate_validation.error && (
-                        <div className="p-4 bg-red-50 rounded-lg">
-                          <div className="flex items-center gap-2 mb-2">
-                            <XCircle className="w-4 h-4 text-red-600" />
-                            <h4 className="font-medium text-red-800">Extraction Error</h4>
-                          </div>
-                          <p className="text-sm text-red-700">{request.medical_certificate_validation.error}</p>
                         </div>
                       )}
                     </div>
@@ -934,7 +976,7 @@ export default function LeaveRequestDetailPage() {
         <div className="space-y-4">
           <div className="bg-gray-50 p-4 rounded-lg max-h-[50vh] overflow-auto">
             <pre className="text-sm text-gray-700 whitespace-pre-wrap font-mono">
-              {request?.medical_certificate_validation?.extracted_text_preview || 'No text extracted'}
+              {request?.medical_certificate_validation?.extracted_text || 'No text extracted'}
             </pre>
           </div>
           <p className="text-xs text-gray-500">

@@ -7,11 +7,19 @@ from app.services.leave_utils import (
     is_blocking_violation,
     build_explanation,
     compute_priority,
-    generate_request_number
+    generate_request_number,
+    calculate_working_days,
+    calculate_working_days_detailed
 )
 from app.services.ai_service import evaluate_leave_with_ai, gemini_service
 from app.services.email_service import email_service
 from app.services.leave_processing import process_leave_request, LeaveProcessingService
+from app.services.certificate_validator import (
+    save_medical_certificate_file,
+    perform_ocr,
+    extract_structured_fields,
+    validate_medical_certificate
+)
 
 __all__ = [
     "days_between",
@@ -23,9 +31,15 @@ __all__ = [
     "build_explanation",
     "compute_priority",
     "generate_request_number",
+    "calculate_working_days",
+    "calculate_working_days_detailed",
     "evaluate_leave_with_ai",
     "gemini_service",
     "email_service",
     "process_leave_request",
-    "LeaveProcessingService"
+    "LeaveProcessingService",
+    "save_medical_certificate_file",
+    "perform_ocr",
+    "extract_structured_fields",
+    "validate_medical_certificate"
 ]

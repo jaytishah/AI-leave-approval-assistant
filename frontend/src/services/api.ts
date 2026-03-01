@@ -118,16 +118,12 @@ export const leaveApi = {
     });
   },
   
-  createLeaveRequest: async (data: {
-    leave_type: string;
-    start_date: string;
-    end_date: string;
-    reason_text?: string;
-    medical_certificate_url?: string;
-    medical_certificate_filename?: string;
-    medical_certificate_size?: number;
-  }) => {
-    const response = await api.post('/leaves/', data);
+  createLeaveRequest: async (formData: FormData) => {
+    const response = await api.post('/leaves/', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
     return response.data;
   },
   
@@ -149,6 +145,16 @@ export const leaveApi = {
   
   cancelRequest: async (id: number) => {
     const response = await api.put(`/leaves/${id}/cancel`);
+    return response.data;
+  },
+  
+  getMyApprovedLeaves: async () => {
+    const response = await api.get('/leaves/approved/me');
+    return response.data;
+  },
+  
+  getMyLeaveBalance: async () => {
+    const response = await api.get('/leaves/balance/me');
     return response.data;
   },
   
@@ -386,5 +392,56 @@ export const adminApi = {
   }) => {
     const response = await api.post(`/users/${userId}/balances`, balanceData);
     return response;
+  },
+
+  // Company Policy Management
+  getCompanyPolicy: async () => {
+    const response = await api.get('/admin/policy');
+    return response.data;
+  },
+
+  updateCompanyPolicy: async (data: {
+    weekly_off_type: string;
+    description?: string;
+  }) => {
+    const response = await api.put('/admin/policy', data);
+    return response.data;
+  },
+
+  calculateWorkingDays: async (data: {
+    start_date: string;
+    end_date: string;
+  }) => {
+    const params = new URLSearchParams({
+      start_date: data.start_date,
+      end_date: data.end_date,
+    });
+    const response = await api.post(`/admin/calculate-working-days?${params.toString()}`);
+    return response.data;
+  },
+
+  // ── AI Analytics ──────────────────────────────────────────────────────────
+  getAIUsageSummary: async (params?: { start_date?: string; end_date?: string }) => {
+    const response = await api.get('/admin/ai-analytics/summary', { params });
+    return response.data;
+  },
+
+  getAIUsagePerEmployee: async (params?: {
+    start_date?: string;
+    end_date?: string;
+    leave_type?: string;
+  }) => {
+    const response = await api.get('/admin/ai-analytics/per-employee', { params });
+    return response.data;
+  },
+
+  getAIUsageDaily: async (days: number = 30) => {
+    const response = await api.get('/admin/ai-analytics/daily', { params: { days } });
+    return response.data;
+  },
+
+  getAIUsageByCallType: async (params?: { start_date?: string; end_date?: string }) => {
+    const response = await api.get('/admin/ai-analytics/by-call-type', { params });
+    return response.data;
   },
 };

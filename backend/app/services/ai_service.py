@@ -191,9 +191,10 @@ class GeminiAIService:
    - Valid reasons: Personal work, family events, urgent personal matters, 
      appointments, home emergencies, personal errands, short trips
 
-2. **SICK LEAVE (SL)** - 5 days per calendar year
+2. **SICK LEAVE (SL)** - 10 days per calendar year
    - Purpose: Illness or medical emergencies ONLY
    - Rules:
+     • Can ONLY be taken for TODAY or PREVIOUS days (not for future dates)
      • Medical certificate MANDATORY if leave exceeds 2 consecutive days
      • Can be carried forward up to maximum 30 days
      • Cannot be encashed
@@ -338,7 +339,7 @@ Do NOT include any text outside the JSON object."""
             "reason_text": reason_text or "No reason provided",
             "company_policy": {
                 "casual_leave_days_per_year": 15,
-                "sick_leave_days_per_year": 5,
+                "sick_leave_days_per_year": 10,
                 "medical_certificate_required_after_days": 2,
                 "reason_mandatory": policy.get("reason_mandatory", True),
                 "long_leave_threshold_days": policy.get("long_leave_threshold_days", 5),
@@ -447,22 +448,32 @@ Do NOT include any text outside the JSON object."""
                 reason_text, policy, history_stats, employee_context
             )
             
-            # Get the prompt
-            prompt = self._get_prompt()
+            # ══════════════════════════════════════════════════════════════
+            # TOKEN OPTIMIZATION: System Instructions
+            # ══════════════════════════════════════════════════════════════
+            # BEFORE: Sent policy (1800+ tokens) + data (200 tokens) = 2000+ input tokens
+            # AFTER:  Sent policy as system_instruction (discounted/cached)
+            #         Only data in contents = ~200 input tokens
+            # SAVINGS: ~80-90% reduction in prompt tokens per request
+            # ══════════════════════════════════════════════════════════════
             
-            # Create the full message
-            full_message = f"{prompt}\n\nLeave Request Data:\n{json.dumps(input_payload, indent=2)}"
+            # Get the policy prompt (this goes to system_instruction)
+            system_prompt = self._get_prompt()
             
-            # Make the API call with the new library
+            # Create concise user message (only the request data)
+            user_message = f"Evaluate this leave request:\n\n{json.dumps(input_payload, indent=2)}"
+            
+            # Make the API call with systemInstruction parameter
             try:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.client.models.generate_content,
                         model=self.model_name,
-                        contents=full_message,
+                        contents=user_message,  # Only request data (small)
                         config=types.GenerateContentConfig(
+                            systemInstruction=system_prompt,  # Policy prompt (optimized by Gemini) - FIXED: camelCase!
                             temperature=temperature,
-                            max_output_tokens=1024,
+                            max_output_tokens=2048
                         )
                     ),
                     timeout=timeout_ms / 1000
@@ -480,6 +491,27 @@ Do NOT include any text outside the JSON object."""
             # Parse the response
             response_text = response.text.strip()
             
+            # Debug: Log the full response
+            print(f"\n{'='*80}")
+            print(f"🤖 AI RAW RESPONSE ({len(response_text)} chars):")
+            print(f"{'='*80}")
+            print(response_text[:1000])  # First 1000 chars
+            if len(response_text) > 1000:
+                print(f"... (truncated, {len(response_text)-1000} more chars)")
+            print(f"{'='*80}\n")
+            
+            # Check for truncated response
+            if len(response_text) < 50:
+                print(f"⚠️ WARNING: Suspiciously short AI response ({len(response_text)} chars): {response_text}")
+                return {
+                    "error": "AI response too short/truncated",
+                    "reason_category": None,
+                    "validity_score": 50,  # Neutral score
+                    "risk_flags": ["truncated_response", "ai_response_incomplete"],
+                    "recommended_action": "MANUAL_REVIEW",
+                    "rationale": "AI response was incomplete. Manual HR review required."
+                }
+            
             # Try to extract JSON from response
             try:
                 # Handle potential markdown code blocks
@@ -487,6 +519,16 @@ Do NOT include any text outside the JSON object."""
                     response_text = response_text.split("```json")[1].split("```")[0]
                 elif "```" in response_text:
                     response_text = response_text.split("```")[1].split("```")[0]
+                
+                # Clean up the JSON text - remove excessive newlines within strings
+                # This handles cases where AI adds newlines in the middle of strings
+                response_text = response_text.strip()
+                
+                # Try to fix common JSON formatting issues from AI
+                # Replace newlines that appear to be inside string values
+                import re
+                # Fix pattern: "text\n" -> "text"
+                response_text = re.sub(r'([^\\])\n\s*"', r'\1"', response_text)
                 
                 result = json.loads(response_text.strip())
                 
@@ -508,31 +550,369 @@ Do NOT include any text outside the JSON object."""
                 if result.get("recommended_action") not in valid_actions:
                     result["recommended_action"] = "MANUAL_REVIEW"
                 
+                # ── Token Usage Capture ──────────────────────────────────────
+                # Attach Gemini usage_metadata as private keys so the caller
+                # can log them without modifying any approval logic.
+                try:
+                    usage = response.usage_metadata
+                    if usage:
+                        result["_prompt_tokens"] = getattr(usage, "prompt_token_count", 0) or 0
+                        result["_output_tokens"] = getattr(usage, "candidates_token_count", 0) or 0
+                        result["_total_tokens"] = getattr(usage, "total_token_count", 0) or 0
+                        result["_model_name"] = self.model_name
+                except Exception:
+                    pass  # Never block result delivery for analytics
+                # ─────────────────────────────────────────────────────────────
+                
                 return result
                 
             except (json.JSONDecodeError, ValueError) as e:
+                # Log the parsing error with response sample for debugging
+                print(f"❌ JSON Parse Error: {str(e)}")
+                print(f"   Response length: {len(response_text)} chars")
+                print(f"   Response sample: {response_text[:200]}...")
+                
                 return {
                     "error": f"Invalid AI response format: {str(e)}",
                     "reason_category": None,
                     "validity_score": 0,
-                    "risk_flags": ["AI returned invalid response"],
+                    "risk_flags": ["AI returned invalid response", "json_parse_error"],
                     "recommended_action": "MANUAL_REVIEW",
                     "rationale": "Could not parse AI response. Routing to manual review."
                 }
                 
         except Exception as e:
+            error_str = str(e)
+            
+            # Check for quota/rate limit errors
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                print(f"⚠️ API QUOTA EXCEEDED: {error_str[:200]}")
+                return {
+                    "error": "API quota exceeded",
+                    "reason_category": None,
+                    "validity_score": 50,  # Neutral score for quota issues
+                    "risk_flags": ["api_quota_exceeded"],
+                    "recommended_action": "MANUAL_REVIEW",
+                    "rationale": "API quota limit reached. Manual HR review required."
+                }
+            
+            # Check for service unavailable errors
+            if "503" in error_str or "UNAVAILABLE" in error_str:
+                print(f"⚠️ API SERVICE UNAVAILABLE: {error_str[:200]}")
+                return {
+                    "error": "API service unavailable",
+                    "reason_category": None,
+                    "validity_score": 50,
+                    "risk_flags": ["api_unavailable"],
+                    "recommended_action": "MANUAL_REVIEW",
+                    "rationale": "AI service temporarily unavailable. Manual HR review required."
+                }
+            
+            # Generic error
+            print(f"❌ AI EVALUATION ERROR: {error_str[:200]}")
             return {
                 "error": str(e),
                 "reason_category": None,
                 "validity_score": 0,
-                "risk_flags": [f"AI error: {str(e)}"],
+                "risk_flags": [f"AI error: {str(e)[:100]}"],
                 "recommended_action": "MANUAL_REVIEW",
-                "rationale": f"AI evaluation failed: {str(e)}. Routing to manual review."
+                "rationale": f"AI evaluation failed: {str(e)[:150]}. Routing to manual review."
             }
     
     def is_configured(self) -> bool:
         """Check if AI service is properly configured"""
         return self.configured and bool(self.api_key)
+    
+    async def get_medical_certificate_recommendation(
+        self,
+        extracted_text: str,
+        structured_fields: Dict[str, Any],
+        confidence_score: int,
+        confidence_level: str,
+        leave_days_applied: int,
+        temperature: float = 0.3,
+        timeout_ms: int = 30000
+    ) -> Dict[str, Any]:
+        """
+        Get AI recommendation for medical certificate authenticity and validity.
+        
+        STEP 5: AI RECOMMENDATION LAYER
+        
+        This function analyzes medical certificate data and provides an advisory
+        recommendation. IMPORTANT: AI is advisory only and must NOT update final_status.
+        
+        Args:
+            extracted_text: Raw OCR text from certificate
+            structured_fields: Dictionary from extract_structured_fields() containing:
+                - doctor_name_detected, doctor_name_text
+                - clinic_name_detected, clinic_name_text
+                - certificate_date, date_detected
+                - rest_days
+                - diagnosis
+                - registration_number
+                - medical_keywords_detected
+                - signature_or_stamp_detected
+            confidence_score: Score from Step 4 (0-100)
+            confidence_level: Level from Step 4 (HIGH/MEDIUM/LOW)
+            leave_days_applied: Number of leave days requested
+            temperature: AI temperature (default 0.3 for more deterministic)
+            timeout_ms: Timeout in milliseconds
+            
+        Returns:
+            {
+                "ai_recommendation": "APPROVE" | "REJECT" | "REVIEW",
+                "ai_reason": "Clear explanation",
+                "error": None or error message
+            }
+        """
+        
+        # If AI not configured, return safe default
+        if not self.configured:
+            return {
+                "ai_recommendation": "REVIEW",
+                "ai_reason": "AI service unavailable. Manual HR review required for medical certificate verification.",
+                "error": "AI not configured"
+            }
+        
+        try:
+            # ══════════════════════════════════════════════════════════════
+            # TOKEN OPTIMIZATION: System Instructions for Medical Cert
+            # ══════════════════════════════════════════════════════════════
+            # Get the prompt for medical certificate analysis (system context)
+            system_prompt = self._get_medical_certificate_prompt()
+            
+            # Build structured input payload
+            input_data = {
+                "raw_ocr_text_sample": extracted_text[:500] if extracted_text else "N/A",  # First 500 chars
+                "structured_fields": {
+                    "doctor_name_detected": structured_fields.get('doctor_name_detected', False),
+                    "doctor_name_text": structured_fields.get('doctor_name_text'),
+                    "clinic_name_detected": structured_fields.get('clinic_name_detected', False),
+                    "clinic_name_text": structured_fields.get('clinic_name_text'),
+                    "date_detected": structured_fields.get('date_detected', False),
+                    "certificate_date": structured_fields.get('certificate_date'),
+                    "rest_days": structured_fields.get('rest_days'),
+                    "diagnosis": structured_fields.get('diagnosis'),
+                    "registration_number": structured_fields.get('registration_number'),
+                    "medical_keywords_detected": structured_fields.get('medical_keywords_detected', False),
+                    "signature_or_stamp_detected": structured_fields.get('signature_or_stamp_detected', False),
+                    "contact_number": structured_fields.get('contact_number')
+                },
+                "confidence_analysis": {
+                    "confidence_score": confidence_score,
+                    "confidence_level": confidence_level
+                },
+                "leave_request_context": {
+                    "leave_days_applied": leave_days_applied,
+                    "rest_days_in_certificate": structured_fields.get('rest_days')
+                }
+            }
+            
+            # Create concise user message (only certificate data)
+            user_message = f"Analyze this medical certificate:\n\n{json.dumps(input_data, indent=2)}"
+            
+            # Make AI API call with systemInstruction
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.models.generate_content,
+                        model=self.model_name,
+                        contents=user_message,  # Only certificate data
+                        config=types.GenerateContentConfig(
+                            systemInstruction=system_prompt,  # Medical cert analysis prompt (optimized) - FIXED: camelCase!
+                            temperature=temperature,
+                            max_output_tokens=1024
+                        )
+                    ),
+                    timeout=timeout_ms / 1000
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI analysis timed out. Manual HR review recommended for thorough verification.",
+                    "error": "AI timeout"
+                }
+            
+            # Parse response with robust JSON extraction
+            response_text = response.text.strip()
+            
+            # SAFE JSON PARSING with multiple fallback strategies
+            parsed_result = self._safe_parse_json_response(response_text)
+            
+            if parsed_result is None:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI response could not be parsed. Manual HR review required for proper verification.",
+                    "error": "Failed to parse AI response after all attempts"
+                }
+            
+            # Validate required fields
+            if "ai_recommendation" not in parsed_result or "ai_reason" not in parsed_result:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI response missing required fields. Manual HR review required.",
+                    "error": "Missing required fields in AI response"
+                }
+            
+            # Ensure valid recommendation value
+            valid_recommendations = ["APPROVE", "REJECT", "REVIEW"]
+            if parsed_result["ai_recommendation"] not in valid_recommendations:
+                parsed_result["ai_recommendation"] = "REVIEW"
+            
+            # Apply business rules to AI recommendation
+            parsed_result = self._apply_recommendation_rules(parsed_result, confidence_level, structured_fields, leave_days_applied)
+            
+            # ── Token Usage Capture ──────────────────────────────────────
+            try:
+                usage = response.usage_metadata
+                if usage:
+                    parsed_result["_prompt_tokens"] = getattr(usage, "prompt_token_count", 0) or 0
+                    parsed_result["_output_tokens"] = getattr(usage, "candidates_token_count", 0) or 0
+                    parsed_result["_total_tokens"] = getattr(usage, "total_token_count", 0) or 0
+                    parsed_result["_model_name"] = self.model_name
+            except Exception:
+                pass  # Never block result delivery for analytics
+            # ─────────────────────────────────────────────────────────────
+            
+            parsed_result["error"] = None
+            return parsed_result
+        
+        except Exception as e:
+            # Handle API errors (503, 429, etc.)
+            error_str = str(e)
+            if "503" in error_str or "UNAVAILABLE" in error_str:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI service temporarily unavailable. Manual HR review recommended.",
+                    "error": "503 Service Unavailable"
+                }
+            elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI quota exceeded. Manual HR review required.",
+                    "error": "429 Quota Exceeded"
+                }
+            else:
+                return {
+                    "ai_recommendation": "REVIEW",
+                    "ai_reason": "AI analysis encountered an error. Manual HR review required.",
+                    "error": error_str[:200]
+                }
+    
+    def _safe_parse_json_response(self, response_text: str) -> Optional[Dict[str, Any]]:
+        """Safely parse JSON from AI response with multiple fallback strategies"""
+        
+        # DEBUG: Log the raw response  
+        print(f"\n[DEBUG] Raw AI response length: {len(response_text)}")
+        print(f"[DEBUG] First 300 chars: {response_text[:300]}")
+        print(f"[DEBUG] Last 100 chars: {response_text[-100:]}")
+        
+        # Strategy 1: Direct JSON parsing (for clean responses)
+        try:
+            result = json.loads(response_text.strip())
+            print("[DEBUG] Strategy 1 (direct parse): SUCCESS")
+            return result
+        except json.JSONDecodeError as e:
+            print(f"[DEBUG] Strategy 1 failed: {e}")
+        
+        # Strategy 2: Remove markdown code blocks (```json ... ```)
+        try:
+            cleaned = response_text
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(cleaned)
+            print("[DEBUG] Strategy 2 (remove markdown): SUCCESS")
+            return result
+        except (json.JSONDecodeError, IndexError) as e:
+            print(f"[DEBUG] Strategy 2 failed: {e}")
+        
+        # Strategy 3: Regex extraction to find JSON object
+        try:
+            # Look for { ... } pattern
+            json_pattern = r'\{[^{}]*"ai_recommendation"[^{}]*"ai_reason"[^{}]*\}'
+            match = re.search(json_pattern, response_text, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+                result = json.loads(json_str)
+                print("[DEBUG] Strategy 3 (regex): SUCCESS")
+                return result
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[DEBUG] Strategy 3 failed: {e}")
+        
+        # Strategy 4: Try to extract just the JSON object boundaries
+        try:
+            first_brace = response_text.find('{')
+            last_brace = response_text.rfind('}')
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                json_str = response_text[first_brace:last_brace+1]
+                result = json.loads(json_str)
+                print("[DEBUG] Strategy 4 (brace extraction): SUCCESS")
+                return result
+        except json.JSONDecodeError as e:
+            print(f"[DEBUG] Strategy 4 failed: {e}")
+        
+        # All strategies failed
+        print("[DEBUG] ALL PARSING STRATEGIES FAILED")
+        return None
+    
+    def _get_medical_certificate_prompt(self) -> str:
+        """Get the prompt for medical certificate AI analysis"""
+        return """You are a medical certificate analyzer. Provide ADVISORY recommendations only.
+
+CRITICAL: Return ONLY pure JSON. Do NOT wrap in markdown. Do NOT use ```json. Do NOT add explanation outside JSON.
+
+Respond with this EXACT JSON format (keep ai_reason under 150 characters):
+{"ai_recommendation": "APPROVE", "ai_reason": "Brief explanation"}
+
+RULES:
+- APPROVE: All critical fields detected, HIGH confidence, leave days match rest days
+- REJECT: Multiple critical fields missing AND LOW confidence, OR leave days exceed rest by 2x+
+- REVIEW: Any uncertainty, MEDIUM/LOW confidence, or missing critical fields (DEFAULT - use when unsure)
+
+Evaluate: doctor detected?, clinic detected?, date detected?, confidence level, leave vs rest days match?
+Keep ai_reason concise. Return PURE JSON ONLY - no markdown, no code blocks, no extra text."""
+    
+    def _apply_recommendation_rules(
+        self,
+        ai_result: Dict[str, Any],
+        confidence_level: str,
+        structured_fields: Dict[str, Any],
+        leave_days_applied: int
+    ) -> Dict[str, Any]:
+        """
+        Apply business rules to override AI recommendation if needed.
+        
+        This ensures AI doesn't make inappropriate recommendations that
+        violate business policies.
+        """
+        
+        # Rule 1: LOW confidence should always lean towards REVIEW
+        if confidence_level == "LOW" and ai_result["ai_recommendation"] == "APPROVE":
+            ai_result["ai_recommendation"] = "REVIEW"
+            ai_result["ai_reason"] = f"Confidence level is LOW. {ai_result['ai_reason']} Manual review recommended."
+        
+        # Rule 2: Missing critical fields → REVIEW (never APPROVE)
+        doctor_detected = structured_fields.get('doctor_name_detected', False)
+        clinic_detected = structured_fields.get('clinic_name_detected', False)
+        date_detected = structured_fields.get('date_detected', False)
+        
+        critical_missing = not (doctor_detected and clinic_detected and date_detected)
+        
+        if critical_missing and ai_result["ai_recommendation"] == "APPROVE":
+            ai_result["ai_recommendation"] = "REVIEW"
+            ai_result["ai_reason"] = f"Critical fields missing (doctor, clinic, or date). {ai_result['ai_reason']} Requires HR verification."
+        
+        # Rule 3: Extreme mismatch in leave days → REVIEW or REJECT
+        rest_days = structured_fields.get('rest_days')
+        if rest_days and leave_days_applied > (rest_days * 2):
+            if ai_result["ai_recommendation"] == "APPROVE":
+                ai_result["ai_recommendation"] = "REVIEW"
+                ai_result["ai_reason"] = f"Leave days ({leave_days_applied}) significantly exceed prescribed rest ({rest_days}). {ai_result['ai_reason']} Requires HR review."
+        
+        return ai_result
 
 
 # Singleton instance
@@ -565,6 +945,50 @@ async def evaluate_leave_with_ai(
         policy=policy,
         history_stats=history_stats,
         employee_context=employee_context,
+        temperature=temperature,
+        timeout_ms=timeout_ms
+    )
+
+
+async def get_ai_recommendation(
+    extracted_text: str,
+    structured_fields: Dict[str, Any],
+    confidence_score: int,
+    confidence_level: str,
+    leave_days_applied: int,
+    ai_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Wrapper function to get AI recommendation for medical certificate.
+    
+    STEP 5: AI RECOMMENDATION LAYER
+    
+    This is the main entry point for getting AI recommendations on medical certificates.
+    
+    Args:
+        extracted_text: Raw OCR text from certificate
+        structured_fields: Dictionary from extract_structured_fields()
+        confidence_score: Score from Step 4 (0-100)
+        confidence_level: Level from Step 4 (HIGH/MEDIUM/LOW)
+        leave_days_applied: Number of leave days requested
+        ai_config: Optional config dict with temperature and timeout_ms
+        
+    Returns:
+        {
+            "ai_recommendation": "APPROVE" | "REJECT" | "REVIEW",
+            "ai_reason": "Clear explanation",
+            "error": None or error message
+        }
+    """
+    temperature = ai_config.get("temperature", 0.3) if ai_config else 0.3
+    timeout_ms = ai_config.get("timeout_ms", 30000) if ai_config else 30000
+    
+    return await gemini_service.get_medical_certificate_recommendation(
+        extracted_text=extracted_text,
+        structured_fields=structured_fields,
+        confidence_score=confidence_score,
+        confidence_level=confidence_level,
+        leave_days_applied=leave_days_applied,
         temperature=temperature,
         timeout_ms=timeout_ms
     )

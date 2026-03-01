@@ -47,7 +47,13 @@ from app.schemas.schemas import (
     HRDashboard,
     AdminDashboard,
     ApprovalTaskResponse,
-    LeaveStats
+    LeaveStats,
+    CompanyPolicyUpdate,
+    CompanyPolicyResponse,
+    AIUsageSummary,
+    AIUsagePerEmployee,
+    AIUsageDailyPoint,
+    AIUsageByCallType
 )
 
 __all__ = [
@@ -99,5 +105,11 @@ __all__ = [
     "HRDashboard",
     "AdminDashboard",
     "ApprovalTaskResponse",
-    "LeaveStats"
+    "LeaveStats",
+    "CompanyPolicyUpdate",
+    "CompanyPolicyResponse",
+    "AIUsageSummary",
+    "AIUsagePerEmployee",
+    "AIUsageDailyPoint",
+    "AIUsageByCallType",
 ]

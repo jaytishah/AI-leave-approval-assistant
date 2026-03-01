@@ -1,13 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 from typing import List, Optional
 from datetime import datetime, timedelta
+import uuid
+import os
 
 from app.core import get_db
 from app.models import (
     LeaveRequest, LeaveStatus, LeaveType, LeaveBalance,
-    LeaveAuditLog, User, LeavePolicy, RiskLevel
+    LeaveAuditLog, User, LeavePolicy, RiskLevel, MedicalCertificate, AIUsageLog
 )
 from app.schemas import (
     LeaveRequestCreate, LeaveRequestResponse, LeaveRequestUpdate,
@@ -17,104 +19,204 @@ from app.schemas import (
 )
 from app.api.auth import get_current_user, require_role
 from app.models import UserRole
-from app.services import process_leave_request, generate_request_number, business_days_between
+from app.services import process_leave_request, generate_request_number, business_days_between, calculate_working_days
+from app.models import CompanyPolicy
 from app.services.email_service import email_service
-from app.services.certificate_validator import validate_medical_certificate, ValidationResult
+from app.services.certificate_validator import (
+    save_medical_certificate_file, 
+    perform_ocr,
+    extract_structured_fields,
+    calculate_confidence,
+    validate_medical_certificate, 
+    ValidationResult
+)
+from app.services.ai_service import get_ai_recommendation
 
 router = APIRouter(prefix="/leaves", tags=["Leave Management"])
 
 
+def check_leave_overlap(employee_id: int, start_date, end_date, db: Session, exclude_leave_id: int = None) -> dict:
+    """
+    Check if a leave request overlaps with existing approved leaves.
+    Returns dict with 'has_overlap' (bool) and 'overlapping_leaves' (list).
+    
+    Handles:
+    - Full overlap: New leave completely covers existing leave
+    - Partial overlap: New leave partially overlaps existing leave
+    - Single day inside multi-day: One day falls within existing leave
+    - Multi-day overlapping single-day: New multi-day overlaps existing single-day
+    """
+    # Query all approved leaves for this employee
+    query = db.query(LeaveRequest).filter(
+        LeaveRequest.employee_id == employee_id,
+        LeaveRequest.status == LeaveStatus.APPROVED
+    )
+    
+    # Exclude current leave if updating
+    if exclude_leave_id:
+        query = query.filter(LeaveRequest.id != exclude_leave_id)
+    
+    approved_leaves = query.all()
+    
+    overlapping_leaves = []
+    
+    for leave in approved_leaves:
+        # Check if there's any overlap between date ranges
+        # Overlap exists if: start1 <= end2 AND end1 >= start2
+        # Normalise DB datetimes to date so comparison always works
+        leave_start = leave.start_date.date() if hasattr(leave.start_date, 'date') else leave.start_date
+        leave_end = leave.end_date.date() if hasattr(leave.end_date, 'date') else leave.end_date
+        if start_date <= leave_end and end_date >= leave_start:
+            overlapping_leaves.append({
+                "id": leave.id,
+                "leave_type": leave.leave_type.value,
+                "start_date": leave.start_date.strftime("%Y-%m-%d"),
+                "end_date": leave.end_date.strftime("%Y-%m-%d"),
+                "total_days": leave.total_days
+            })
+    
+    return {
+        "has_overlap": len(overlapping_leaves) > 0,
+        "overlapping_leaves": overlapping_leaves
+    }
+
+
 @router.post("/", response_model=LeaveRequestResponse, status_code=status.HTTP_201_CREATED)
 async def create_leave_request(
-    leave_data: LeaveRequestCreate,
+    leave_type: str = Form(...),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    reason_text: Optional[str] = Form(None),
+    is_emergency: Optional[bool] = Form(False),
+    medical_certificate: Optional[UploadFile] = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new leave request"""
+    """Create a new leave request with file upload support"""
+    
+    # Parse dates
+    try:
+        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format"
+        )
+    
+    # Validate leave type
+    try:
+        leave_type_enum = LeaveType(leave_type.upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid leave type: {leave_type}"
+        )
+    
+    # Sick leave validation: Can only be taken for today or previous days
+    if leave_type_enum == LeaveType.SICK:
+        today = datetime.now().date()
+        leave_start_date = start_dt.date()
+        if leave_start_date > today:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Sick leave can only be taken for today or previous days, not for future dates"
+            )
+    
     # Generate request number
     request_number = generate_request_number()
     
-    # Get policy for holidays
-    policy = db.query(LeavePolicy).filter(
-        LeavePolicy.is_active == True,
-        or_(
-            LeavePolicy.department_id == current_user.department_id,
-            LeavePolicy.department_id == None
+    # Check for overlapping approved leaves
+    overlap_check = check_leave_overlap(
+        employee_id=current_user.id,
+        start_date=start_dt.date(),
+        end_date=end_dt.date(),
+        db=db
+    )
+    
+    if overlap_check["has_overlap"]:
+        overlapping = overlap_check["overlapping_leaves"][0]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Leave request overlaps with already approved {overlapping['leave_type']} leave from {overlapping['start_date']} to {overlapping['end_date']}"
         )
-    ).first()
     
-    holidays = policy.holidays if policy else []
+    # Get holidays from Holiday table (active holidays only)
+    from app.models.models import Holiday
+    holiday_records = db.query(Holiday).filter(
+        Holiday.is_active == True
+    ).all()
+    holidays = [h.date.strftime("%Y-%m-%d") for h in holiday_records]
     
-    # Calculate total days
-    total_days = business_days_between(
-        leave_data.start_date,
-        leave_data.end_date,
+    # Get company policy for weekly off configuration
+    company_policy = db.query(CompanyPolicy).order_by(CompanyPolicy.updated_at.desc()).first()
+    weekly_off_type = company_policy.weekly_off_type.value if company_policy else "SAT_SUN"
+    
+    # Calculate total days using proper working days calculation
+    total_days = calculate_working_days(
+        start_dt.date(),
+        end_dt.date(),
+        weekly_off_type,
         holidays
     )
     
-    # Validate medical certificate for sick leave
-    if leave_data.leave_type == LeaveType.SICK:
-        if not leave_data.medical_certificate_url:
+    # Medical certificate handling
+    certificate_url = None
+    certificate_filename = None
+    certificate_size = None
+    certificate_validation = None
+    
+    # Validate medical certificate for sick leave >= 2 working days
+    if leave_type_enum == LeaveType.SICK and total_days >= 2:
+        if not medical_certificate:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Medical certificate is mandatory for sick leave"
-            )
-        if leave_data.medical_certificate_size and leave_data.medical_certificate_size > 5 * 1024 * 1024:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Medical certificate file size must not exceed 5MB"
+                detail=f"Medical certificate is mandatory for sick leave of {total_days} working days or more"
             )
         
-        # Extract and validate medical certificate content
-        try:
-            validation_result = validate_medical_certificate(
-                file_data=leave_data.medical_certificate_url,
-                filename=leave_data.medical_certificate_filename or "certificate.pdf"
-            )
+        # Process medical certificate with Step 1 & 2
+        if medical_certificate:
+            # Read file contents
+            contents = await medical_certificate.read()
+            file_size = len(contents)
             
-            # Store validation details for HR review
-            certificate_validation = {
-                "is_valid": validation_result.is_valid,
-                "result": validation_result.result.value,
-                "confidence_score": validation_result.confidence_score,
-                "detected_fields": validation_result.detected_fields,
-                "validation_notes": validation_result.validation_notes,
-                "extracted_text_preview": validation_result.extracted_text[:200] if validation_result.extracted_text else None
-            }
-            
-            # If certificate is clearly invalid, reject immediately
-            if validation_result.result == ValidationResult.INVALID:
+            # Check file size (5MB max)
+            if file_size > 5 * 1024 * 1024:  # 5MB
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Medical certificate validation failed: {', '.join(validation_result.validation_notes)}"
+                    detail="Medical certificate file size must not exceed 5MB"
                 )
-                
-        except HTTPException:
-            raise
-        except Exception as e:
-            # Log error but allow submission for manual review
-            print(f"Certificate validation error: {e}")
-            certificate_validation = {
-                "is_valid": None,
-                "result": "EXTRACTION_FAILED",
-                "error": str(e),
-                "validation_notes": ["Certificate will be reviewed manually by HR"]
+            
+            # Validate file type
+            allowed_types = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg']
+            if medical_certificate.content_type not in allowed_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Only PDF, JPG, and PNG files are allowed"
+                )
+            
+            certificate_filename = medical_certificate.filename
+            certificate_size = file_size
+            
+            # Store for later use after leave_request is created
+            certificate_data = {
+                "contents": contents,
+                "filename": certificate_filename
             }
-    else:
-        certificate_validation = None
     
     # Create leave request
     leave_request = LeaveRequest(
         request_number=request_number,
         employee_id=current_user.id,
-        leave_type=leave_data.leave_type,
-        start_date=leave_data.start_date,
-        end_date=leave_data.end_date,
+        leave_type=leave_type_enum,
+        start_date=start_dt.date(),
+        end_date=end_dt.date(),
         total_days=total_days,
-        reason_text=leave_data.reason_text,
-        medical_certificate_url=leave_data.medical_certificate_url,
-        medical_certificate_filename=leave_data.medical_certificate_filename,
-        medical_certificate_size=leave_data.medical_certificate_size,
+        reason_text=reason_text,
+        is_emergency=is_emergency,
+        medical_certificate_url=certificate_url,
+        medical_certificate_filename=certificate_filename,
+        medical_certificate_size=certificate_size,
         medical_certificate_validation=certificate_validation,
         status=LeaveStatus.PENDING
     )
@@ -123,6 +225,192 @@ async def create_leave_request(
     db.commit()
     db.refresh(leave_request)
     
+    # ========================================================
+    # STEP 1 & STEP 2: Process Medical Certificate
+    # ========================================================
+    if leave_type_enum == LeaveType.SICK and total_days >= 2 and 'certificate_data' in locals():
+        try:
+            # STEP 1: Save medical certificate file
+            file_info = save_medical_certificate_file(
+                file_content=certificate_data['contents'],
+                filename=certificate_data['filename'],
+                leave_id=leave_request.id
+            )
+            
+            print(f"✓ Step 1 Complete: File saved to {file_info['file_path']}")
+            
+            # STEP 2: Extract text using EasyOCR
+            ocr_result = perform_ocr(file_info['file_path'])
+            
+            if ocr_result['success']:
+                print(f"✓ Step 2 Complete: OCR extracted {len(ocr_result['extracted_text'])} characters")
+            else:
+                print(f"⚠ Step 2: OCR extraction had issues: {ocr_result['error']}")
+            
+            # STEP 3: Extract structured fields from OCR text (ROBUST VERSION)
+            structured_fields = {}
+            if ocr_result['success'] and ocr_result.get('extracted_text'):
+                structured_fields = extract_structured_fields(ocr_result['extracted_text'])
+                
+                # Count detected fields (using detection flags, not text extraction)
+                detection_count = sum([
+                    structured_fields.get('doctor_name_detected', False),
+                    structured_fields.get('clinic_name_detected', False),
+                    structured_fields.get('date_detected', False),
+                    structured_fields.get('medical_keywords_detected', False),
+                    structured_fields.get('signature_or_stamp_detected', False)
+                ])
+                print(f"✓ Step 3 Complete (ROBUST): {detection_count}/5 mandatory fields DETECTED")
+                
+                # Also count successfully extracted text (optional)
+                extraction_count = sum([
+                    bool(structured_fields.get('doctor_name_text')),
+                    bool(structured_fields.get('clinic_name_text')),
+                    bool(structured_fields.get('certificate_date')),
+                    structured_fields.get('medical_keywords_detected', False),
+                    structured_fields.get('signature_or_stamp_detected', False)
+                ])
+                print(f"  └─ Text extracted for {extraction_count}/5 fields")
+            else:
+                # No OCR text, use default None values
+                structured_fields = {
+                    'doctor_name_text': None,
+                    'doctor_name_detected': False,
+                    'clinic_name_text': None,
+                    'clinic_name_detected': False,
+                    'certificate_date': None,
+                    'date_detected': False,
+                    'medical_keywords_detected': False,
+                    'signature_or_stamp_detected': False,
+                    'rest_days': None,
+                    'diagnosis': None,
+                    'registration_number': None,
+                    'contact_number': None
+                }
+            
+            # STEP 4: Calculate confidence score (RULE-BASED ENGINE)
+            confidence_result = calculate_confidence(structured_fields)
+            print(f"✓ Step 4 Complete: Confidence Score = {confidence_result['confidence_score']}/100 ({confidence_result['confidence_level']})")
+            print(f"  └─ Requires HR Review: {confidence_result['requires_hr_review']}")
+            print(f"  └─ Scoring Breakdown: {confidence_result['scoring_breakdown']}")
+            
+            # STEP 5: Get AI Recommendation (GEMINI API - ADVISORY ONLY)
+            ai_result = None
+            ai_recommendation_value = None
+            ai_reason_value = None
+            
+            try:
+                # Calculate leave days from request
+                leave_days = (leave_request.end_date - leave_request.start_date).days + 1
+                
+                # Call AI service (async)
+                import asyncio
+                ai_result = await get_ai_recommendation(
+                    extracted_text=ocr_result.get('extracted_text', ''),
+                    structured_fields=structured_fields,
+                    confidence_score=confidence_result['confidence_score'],
+                    confidence_level=confidence_result['confidence_level'],
+                    leave_days_applied=leave_days
+                )
+                
+                ai_recommendation_value = ai_result.get('ai_recommendation')
+                ai_reason_value = ai_result.get('ai_reason')
+                
+                print(f"✓ Step 5 Complete: AI Recommendation = {ai_recommendation_value}")
+                print(f"  └─ AI Reason: {ai_reason_value[:100]}..." if ai_reason_value and len(ai_reason_value) > 100 else f"  └─ AI Reason: {ai_reason_value}")
+                if ai_result.get('error'):
+                    print(f"  └─ AI Warning: {ai_result['error']}")
+                
+                # ── Analytics: log medical-cert token usage (isolated) ───────
+                try:
+                    if ai_result.get("_prompt_tokens") is not None:
+                        from app.core import settings as _settings
+                        usage_log = AIUsageLog(
+                            employee_id=current_user.id,
+                            leave_request_id=leave_request.id,
+                            call_type="MEDICAL_CERT",
+                            leave_type=leave_type_enum.value,
+                            model_name=ai_result.get("_model_name", _settings.GEMINI_MODEL),
+                            prompt_tokens=ai_result.get("_prompt_tokens", 0),
+                            output_tokens=ai_result.get("_output_tokens", 0),
+                            total_tokens=ai_result.get("_total_tokens", 0),
+                            ai_recommended_action=ai_recommendation_value
+                        )
+                        db.add(usage_log)
+                        db.commit()
+                        print(f"[AI Analytics] Logged medical-cert usage: {ai_result.get('_total_tokens', 0)} tokens")
+                except Exception as _log_err:
+                    print(f"[AI Analytics] Medical-cert log failed (non-fatal): {_log_err}")
+                # ────────────────────────────────────────────────────────────
+                    
+            except Exception as ai_error:
+                print(f"⚠ Step 5: AI recommendation failed - {ai_error}")
+                # Fallback to safe default
+                ai_recommendation_value = "REVIEW"
+                ai_reason_value = "AI service unavailable. Manual HR review required for medical certificate verification."
+            
+            # Save to medical_certificates table with extracted fields
+            medical_cert = MedicalCertificate(
+                leave_id=leave_request.id,
+                file_path=file_info['file_path'],
+                file_name=file_info['file_name'],
+                file_size=file_info['file_size'],
+                file_type=file_info['file_type'],
+                extracted_text=ocr_result.get('extracted_text'),  # Raw OCR text - NEVER DELETE
+                # Step 3: Structured fields (ROBUST VERSION with detection flags)
+                doctor_name_text=structured_fields.get('doctor_name_text'),
+                doctor_name_detected=structured_fields.get('doctor_name_detected', False),
+                clinic_name_text=structured_fields.get('clinic_name_text'),
+                clinic_name_detected=structured_fields.get('clinic_name_detected', False),
+                certificate_date=structured_fields.get('certificate_date'),
+                date_detected=structured_fields.get('date_detected', False),
+                medical_keywords_detected=structured_fields.get('medical_keywords_detected', False),
+                signature_or_stamp_detected=structured_fields.get('signature_or_stamp_detected', False),
+                rest_days=structured_fields.get('rest_days'),
+                diagnosis=structured_fields.get('diagnosis'),
+                registration_number=structured_fields.get('registration_number'),
+                contact_number=structured_fields.get('contact_number'),
+                # Step 4: Confidence Engine results (RULE-BASED)
+                confidence_score=confidence_result['confidence_score'],
+                confidence_level=confidence_result['confidence_level'],
+                requires_hr_review=confidence_result['requires_hr_review'],
+                # Step 5: AI Recommendation Layer (GEMINI API - ADVISORY ONLY)
+                ai_recommendation=ai_recommendation_value,
+                ai_reason=ai_reason_value,
+                # Step 6: HR Final Decision (NULL until HR acts)
+                final_status=None,  # NULL until HR acts
+                hr_reason=None
+            )
+            
+            db.add(medical_cert)
+            db.commit()
+            db.refresh(medical_cert)
+            
+            print(f"✓ Medical certificate record created with ID: {medical_cert.id}")
+            
+            # Update leave request with certificate info (for backward compatibility)
+            leave_request.medical_certificate_url = file_info['file_path']
+            leave_request.medical_certificate_filename = file_info['file_name']
+            leave_request.medical_certificate_size = file_info['file_size']
+            leave_request.medical_certificate_validation = {
+                "ocr_success": ocr_result['success'],
+                "ocr_error": ocr_result.get('error'),
+                "text_length": len(ocr_result.get('extracted_text', '')),
+                "status": "PENDING_HR_REVIEW"
+            }
+            db.commit()
+            db.refresh(leave_request)
+            
+        except Exception as e:
+            print(f"✗ Error processing medical certificate: {e}")
+            # Don't fail the entire request - flag for HR manual review
+            leave_request.medical_certificate_validation = {
+                "error": str(e),
+                "status": "PROCESSING_FAILED_NEEDS_HR_REVIEW"
+            }
+            db.commit()
+            db.refresh(leave_request)
+    
     # Create audit log
     audit_log = LeaveAuditLog(
         leave_request_id=leave_request.id,
@@ -130,7 +418,7 @@ async def create_leave_request(
         actor_id=current_user.id,
         actor_type="USER",
         new_status=LeaveStatus.PENDING.value,
-        details=f"Leave request submitted for {total_days} days"
+        details=f"Leave request submitted for {total_days} working days"
     )
     db.add(audit_log)
     db.commit()
@@ -140,7 +428,6 @@ async def create_leave_request(
         await process_leave_request(db, leave_request.id)
         db.refresh(leave_request)
     except Exception as e:
-        # Log error but don't fail the request
         print(f"Error processing leave request: {e}")
     
     return LeaveRequestResponse.model_validate(leave_request)
@@ -362,6 +649,27 @@ async def get_my_leave_balance(
     return [LeaveBalanceResponse.model_validate(b) for b in balances]
 
 
+@router.get("/approved/me", response_model=List[dict])
+async def get_my_approved_leaves(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current user's approved leaves for calendar and date blocking"""
+    approved_leaves = db.query(LeaveRequest).filter(
+        LeaveRequest.employee_id == current_user.id,
+        LeaveRequest.status == LeaveStatus.APPROVED
+    ).order_by(LeaveRequest.start_date).all()
+    
+    return [{
+        "id": leave.id,
+        "leave_type": leave.leave_type.value,
+        "start_date": leave.start_date.strftime("%Y-%m-%d"),
+        "end_date": leave.end_date.strftime("%Y-%m-%d"),
+        "total_days": leave.total_days,
+        "reason_text": leave.reason_text
+    } for leave in approved_leaves]
+
+
 @router.get("/{leave_id}", response_model=LeaveRequestDetail)
 async def get_leave_request(
     leave_id: int,
@@ -406,6 +714,33 @@ async def get_leave_request(
         
         historical_pattern = f"{total_leaves} approved leaves this year, {recent_leaves} in last 60 days"
     
+    # Fetch medical certificate data from medical_certificates table (Steps 3-5)
+    if leave_request.leave_type == LeaveType.SICK and leave_request.medical_certificate_url:
+        medical_cert = db.query(MedicalCertificate).filter(
+            MedicalCertificate.leave_id == leave_request.id
+        ).first()
+        
+        if medical_cert:
+            # Populate medical_certificate_validation with comprehensive Step 3-5 data
+            leave_request.medical_certificate_validation = {
+                # Step 3: Structured Field Extraction
+                "doctor_name_text": medical_cert.doctor_name_text,
+                "clinic_name_text": medical_cert.clinic_name_text,
+                "certificate_date": medical_cert.certificate_date,
+                "rest_days": medical_cert.rest_days,
+                "diagnosis": medical_cert.diagnosis,
+                "registration_number": medical_cert.registration_number,
+                "contact_number": medical_cert.contact_number,
+                "extracted_text": medical_cert.extracted_text,
+                # Step 4: Confidence Engine
+                "confidence_score": medical_cert.confidence_score,
+                "confidence_level": medical_cert.confidence_level,
+                "requires_hr_review": medical_cert.requires_hr_review,
+                # Step 5: AI Recommendation
+                "ai_recommendation": medical_cert.ai_recommendation,
+                "ai_reason": medical_cert.ai_reason
+            }
+    
     return LeaveRequestDetail(
         **LeaveRequestResponse.model_validate(leave_request).model_dump(),
         employee_name=f"{employee.first_name} {employee.last_name}" if employee else "Unknown",
@@ -441,6 +776,26 @@ async def approve_leave_request(
     leave_request.reviewed_by = current_user.id
     leave_request.reviewed_at = datetime.now()
     leave_request.reviewer_comments = comments
+    
+    # STEP 6 FIX: Update medical certificate final_status if certificate exists
+    if leave_request.leave_type == LeaveType.SICK and leave_request.medical_certificate_url:
+        medical_cert = db.query(MedicalCertificate).filter(
+            MedicalCertificate.leave_id == leave_request.id
+        ).first()
+        
+        if medical_cert:
+            # Update medical certificate final status
+            medical_cert.final_status = "APPROVED"
+            medical_cert.hr_reason = comments or "Medical certificate approved by HR"
+            
+            # Log AI vs HR decision for audit (if AI recommendation exists)
+            if medical_cert.ai_recommendation:
+                if medical_cert.ai_recommendation == "APPROVE":
+                    print(f"✓ HR decision aligns with AI recommendation (APPROVE)")
+                else:
+                    print(f"⚠ HR overrode AI recommendation ({medical_cert.ai_recommendation} → APPROVED)")
+                    if comments:
+                        print(f"  HR reasoning: {comments}")
     
     # Update leave balance
     employee = db.query(User).filter(User.id == leave_request.employee_id).first()
@@ -510,6 +865,25 @@ async def reject_leave_request(
     leave_request.reviewed_by = current_user.id
     leave_request.reviewed_at = datetime.now()
     leave_request.reviewer_comments = reason
+    
+    # STEP 6 FIX: Update medical certificate final_status if certificate exists
+    if leave_request.leave_type == LeaveType.SICK and leave_request.medical_certificate_url:
+        medical_cert = db.query(MedicalCertificate).filter(
+            MedicalCertificate.leave_id == leave_request.id
+        ).first()
+        
+        if medical_cert:
+            # Update medical certificate final status
+            medical_cert.final_status = "REJECTED"
+            medical_cert.hr_reason = reason
+            
+            # Log AI vs HR decision for audit (if AI recommendation exists)
+            if medical_cert.ai_recommendation:
+                if medical_cert.ai_recommendation == "REJECT":
+                    print(f"✓ HR decision aligns with AI recommendation (REJECT)")
+                else:
+                    print(f"⚠ HR overrode AI recommendation ({medical_cert.ai_recommendation} → REJECTED)")
+                    print(f"  HR reasoning: {reason}")
     
     # Get employee for email
     employee = db.query(User).filter(User.id == leave_request.employee_id).first()
